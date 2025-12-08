@@ -21,8 +21,10 @@ import os
 import datetime
 import chess.pgn
 import csv
+import time
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+
 
 def get_archive_urls(username):
     url = f"https://api.chess.com/pub/player/{username}/games/archives"
@@ -33,6 +35,7 @@ def get_archive_urls(username):
     except requests.RequestException as e:
         print(f"❌ HTTP error: {e}")
         return []
+
 
 def download_pgn(username, archive_url, download_dir):
     date_segment = archive_url.split("/")[-2:]
@@ -56,6 +59,7 @@ def download_pgn(username, archive_url, download_dir):
         print(f"❌ Failed to download {pgn_url}: {e}")
         return None
 
+
 def extract_opponents_from_pgn_files(username, archive_dir):
     opponents = set()
     for filename in os.listdir(archive_dir):
@@ -75,12 +79,23 @@ def extract_opponents_from_pgn_files(username, archive_dir):
                     opponents.add(white)
     return sorted(opponents)
 
+
 def fetch_account_info(username):
+    """
+    Fetch account info for a single username.
+
+    Returns (info_dict, error_message, status_code)
+
+    info_dict is None on error.
+    error_message is None on success.
+    status_code is an int when available, otherwise None.
+    """
     api_url = f"https://api.chess.com/pub/player/{username}"
     try:
         resp = requests.get(api_url, headers=HEADERS)
-        if resp.status_code == 404:
-            return None, "Not found"
+        status_code = resp.status_code
+        if status_code == 404:
+            return None, "Not found", status_code
         resp.raise_for_status()
         data = resp.json()
         return {
@@ -95,17 +110,46 @@ def fetch_account_info(username):
             "Joined": data.get("joined", 0),
             "Status": data.get("status", ""),
             "League": data.get("league", "")
-        }, None
+        }, None, status_code
     except requests.RequestException as e:
-        return None, str(e)
+        status_code = None
+        if hasattr(e, "response") and e.response is not None:
+            try:
+                status_code = e.response.status_code
+            except Exception:
+                status_code = None
+        return None, str(e), status_code
+
+
+def is_transient_error(status_code):
+    """
+    Classify errors for retry decisions.
+
+    Transient:
+      - status_code is None (network type failure)
+      - status_code == 429
+      - 500 <= status_code < 600
+
+    Permanent:
+      - everything else
+    """
+    if status_code is None:
+        return True
+    if status_code == 429:
+        return True
+    if 500 <= status_code < 600:
+        return True
+    return False
+
 
 def main():
     username = input("Enter Chess.com username: ").strip().lower()
-    timestamp = datetime.datetime.now().strftime("%y%m%d")
+    timestamp = datetime.datetime.now().strftime("%y%m%d%H%M")
     archive_dir = os.path.join(os.getcwd(), "archives")
     opponents_file = f"{timestamp}-opponents.txt"
     data_file = f"{timestamp}-opp-data.csv"
     error_log = f"{timestamp}-error.log"
+    request_log = f"{timestamp}-requests.log"
     fpv_file = f"{timestamp}-fpv.csv"
     abuse_file = f"{timestamp}-abuse.csv"
     self_file = f"{timestamp}-self.csv"
@@ -125,9 +169,26 @@ def main():
     print(f"✅ Saved opponents to {opponents_file}")
 
     print("\n🌐 Fetching account info...")
-    with open(data_file, "w", newline="") as csvfile,          open(fpv_file, "w", newline="") as fpv_csv,          open(abuse_file, "w", newline="") as abuse_csv,          open(self_file, "w", newline="") as self_csv,          open(error_log, "w") as errfile:
+    with open(data_file, "w", newline="") as csvfile, \
+         open(fpv_file, "w", newline="") as fpv_csv, \
+         open(abuse_file, "w", newline="") as abuse_csv, \
+         open(self_file, "w", newline="") as self_csv, \
+         open(error_log, "w") as errfile, \
+         open(request_log, "w") as reqfile:
 
-        fieldnames = ["Player_id", "API_URL", "User_URL", "Username", "Title", "Followers", "Country", "Last_online", "Joined", "Status", "League"]
+        fieldnames = [
+            "Player_id",
+            "API_URL",
+            "User_URL",
+            "Username",
+            "Title",
+            "Followers",
+            "Country",
+            "Last_online",
+            "Joined",
+            "Status",
+            "League",
+        ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer_fpv = csv.DictWriter(fpv_csv, fieldnames=fieldnames)
         writer_abuse = csv.DictWriter(abuse_csv, fieldnames=fieldnames)
@@ -138,11 +199,67 @@ def main():
         writer_abuse.writeheader()
         writer_self.writeheader()
 
+        # request_log header
+        reqfile.write("timestamp|username|attempt|result|status_code|note\n")
+
         total = len(opponents)
+        max_attempts = 3
+
         for idx, opp in enumerate(opponents, start=1):
             print(f"[{idx}/{total}] Fetching: {opp}")
-            info, error = fetch_account_info(opp)
-            if info:
+
+            attempt = 0
+            success = False
+            last_error = None
+            last_status = None
+            info = None
+            had_error = False
+
+            while attempt < max_attempts and not success:
+                attempt += 1
+                info, error, status_code = fetch_account_info(opp)
+                now_str = datetime.datetime.now().isoformat(timespec="seconds")
+
+                if info is not None:
+                    # success on this attempt
+                    success = True
+                    if had_error:
+                        # only log success if there were prior errors
+                        note = "resolved_after_retry"
+                        reqfile.write(
+                            f"{now_str}|{opp}|{attempt}|SUCCESS|{status_code}|{note}\n"
+                        )
+                    break
+
+                # failure on this attempt
+                last_error = error
+                last_status = status_code
+                transient = is_transient_error(status_code)
+                had_error = True
+
+                if transient:
+                    note = f"transient_error:{error}"
+                else:
+                    note = f"permanent_error:{error}"
+
+                reqfile.write(
+                    f"{now_str}|{opp}|{attempt}|ERROR|{status_code}|{note}\n"
+                )
+
+                if not transient:
+                    # do not retry permanent errors
+                    break
+
+                if attempt < max_attempts:
+                    # bounded backoff
+                    sleep_seconds = 10 * attempt
+                    print(
+                        f"   transient error for {opp} (status={status_code}), "
+                        f"retrying in {sleep_seconds} seconds..."
+                    )
+                    time.sleep(sleep_seconds)
+
+            if success and info is not None:
                 writer.writerow(info)
                 status = str(info.get("Status", "")).strip().lower()
                 if status == "closed:fair_play_violations":
@@ -152,14 +269,22 @@ def main():
                 elif status == "closed":
                     writer_self.writerow(info)
                 elif status.startswith("closed"):
-                    print(f"⚠️  Unmatched closed status for {opp}: '{status}'")
-                    errfile.write(f"{opp}: unmatched closed status '{status}'\n")
+                    print(
+                        f"⚠️  Unmatched closed status for {opp}: '{status}'"
+                    )
+                    errfile.write(
+                        f"{opp}: unmatched closed status '{status}'\n"
+                    )
             else:
-                errfile.write(f"{opp}: {error}\n")
-                print(f"⚠️  Failed to fetch {opp}: {error}")
+                # only log here if it never succeeded
+                if last_error is None:
+                    last_error = "Unknown error"
+                errfile.write(f"{opp}: {last_error}\n")
+                print(f"⚠️  Failed to fetch {opp}: {last_error}")
 
     print(f"✅ Account data saved to {data_file}")
     print(f"📄 Errors logged to {error_log}")
+    print(f"📄 Request attempts logged to {request_log}")
     print(f"📄 FPV accounts saved to {fpv_file}")
     print(f"📄 Abuse accounts saved to {abuse_file}")
     print(f"📄 Closed (self) accounts saved to {self_file}")
@@ -178,5 +303,7 @@ def main():
     print(f"📄 Abuse usernames saved to {timestamp}-abuse.txt")
     print(f"📄 Self usernames saved to {timestamp}-self.txt")
 
+
 if __name__ == "__main__":
     main()
+
