@@ -2,7 +2,8 @@
 """
 wdl-history.py
 Fetches player archive data directly from the Chess.com Public API and tallies 
-Win/Draw/Loss stats and Score (W + 0.5 * D) with Score % across 7d, 30d, 90d, and yearly totals.
+Win/Draw/Loss stats and Score (W + 0.5 * D) with Score % across 7d, 30d, 90d, Year to Date, 
+and yearly totals, broken down by time control class (Daily, Bullet, Blitz, Rapid).
 """
 
 import argparse
@@ -22,6 +23,7 @@ HEADERS = {
 # Chess.com result codes mapped to outcome types
 WIN_RESULTS = {'win'}
 DRAW_RESULTS = {'stalemate', 'agreed', 'repetition', 'insufficient', '50move', 'timevsinsufficient'}
+TIME_CLASSES = ["daily", "bullet", "blitz", "rapid"]
 
 
 def fetch_json(url):
@@ -41,6 +43,36 @@ def fetch_json(url):
             return None
     except Exception as e:
         print(f"Error fetching {url}: {e}", file=sys.stderr)
+        return None
+
+
+def classify_game(time_control):
+    """Classify game matching the cc_archive_splitter logic."""
+    tc = str(time_control).strip() if time_control else ""
+
+    if not tc or tc in ("-", "?"):
+        return None
+
+    try:
+        if tc.startswith("1/"):
+            return "daily"
+
+        if "+" in tc:
+            base, inc = map(int, tc.split("+")[:2])
+        else:
+            base = int(tc)
+            inc = 0
+
+        estimated = base + 40 * inc
+
+        if estimated < 180:
+            return "bullet"
+        elif estimated < 600:
+            return "blitz"
+        else:
+            return "rapid"
+
+    except Exception:
         return None
 
 
@@ -85,6 +117,12 @@ def process_player_archives(player_name):
             continue
 
         for game in month_data['games']:
+            time_control = game.get('time_control')
+            kind = classify_game(time_control)
+
+            if not kind or kind not in TIME_CLASSES:
+                continue
+
             end_timestamp = game.get('end_time')
             if not end_timestamp:
                 continue
@@ -108,7 +146,11 @@ def process_player_archives(player_name):
             else:
                 outcome = 'L'
 
-            parsed_games.append({'date': game_date, 'outcome': outcome})
+            parsed_games.append({
+                'date': game_date, 
+                'outcome': outcome, 
+                'time_class': kind
+            })
 
     print("\nProcessing complete!\n")
     return parsed_games
@@ -141,58 +183,76 @@ def main():
     d7 = now - timedelta(days=7)
     d30 = now - timedelta(days=30)
     d90 = now - timedelta(days=90)
+    ytd_start = datetime(now.year, 1, 1, tzinfo=timezone.utc)
 
-    # Buckets
-    recent_buckets = {
-        "Last 7 Days": defaultdict(int),
-        "Last 30 Days": defaultdict(int),
-        "Last 90 Days": defaultdict(int),
-    }
-    
-    yearly_buckets = defaultdict(lambda: defaultdict(int))
+    # Data structure: timeframe -> time_class -> W/D/L tallies
+    timeframes = ["7 Days", "30 Days", "90 Days", "Year to Date"]
+    stats = {tf: {tc: defaultdict(int) for tc in TIME_CLASSES} for tf in timeframes}
+    stats["Yearly"] = defaultdict(lambda: {tc: defaultdict(int) for tc in TIME_CLASSES})
 
     # Aggregate outcomes
     for game in games:
         gdate = game['date']
         outcome = game['outcome']
+        tc = game['time_class']
         year = gdate.year
 
         if gdate >= d7:
-            recent_buckets["Last 7 Days"][outcome] += 1
+            stats["7 Days"][tc][outcome] += 1
         if gdate >= d30:
-            recent_buckets["Last 30 Days"][outcome] += 1
+            stats["30 Days"][tc][outcome] += 1
         if gdate >= d90:
-            recent_buckets["Last 90 Days"][outcome] += 1
+            stats["90 Days"][tc][outcome] += 1
+        if gdate >= ytd_start:
+            stats["Year to Date"][tc][outcome] += 1
 
-        yearly_buckets[year][outcome] += 1
+        stats["Yearly"][year][tc][outcome] += 1
 
-    # --- Output Results ---
-    print(f"=======================================================================")
-    print(f" Chess.com WDL Performance Summary: {player}")
-    print(f"=======================================================================")
-    header_fmt = "{:<20} {:>6} {:>6} {:>6} {:>8} {:>16}"
-    row_fmt    = "{:<20} {:>6} {:>6} {:>6} {:>8} {:>16}"
+    # Format layout widths
+    W_CLASS = 18
+    W_WIN   = 6
+    W_DRAW  = 6
+    W_LOSS  = 6
+    W_TOT   = 8
+    W_SCORE = 16
+    TOTAL_WIDTH = W_CLASS + W_WIN + W_DRAW + W_LOSS + W_TOT + W_SCORE + 15
 
-    print(header_fmt.format("Timeframe", "Win", "Draw", "Loss", "Total", "Score (%)"))
-    print("-" * 68)
+    print("\n" + "=" * TOTAL_WIDTH)
+    print(f"  WDL PERFORMANCE SUMMARY FOR: {player}")
+    print("=" * TOTAL_WIDTH)
 
-    # Print Recent Windows
-    for label, tally in recent_buckets.items():
-        w, d, l, total, score, score_pct = calculate_stats(tally)
-        score_str = f"{score:.1f} ({score_pct:.1f}%)"
-        print(row_fmt.format(label, w, d, l, total, score_str))
+    def print_section(section_label, tc_dict):
+        # Filter down to classes that have at least 1 game in this timeframe
+        active_classes = [tc for tc in TIME_CLASSES if sum(tc_dict[tc].values()) > 0]
+        if not active_classes:
+            return
 
-    print("-" * 68)
-    print(" Yearly History:")
-    print("-" * 68)
+        print(f"\n{section_label}")
+        print("-" * TOTAL_WIDTH)
+        header_str = f"{'':<{W_CLASS}} | {'Win':>{W_WIN}} | {'Draw':>{W_DRAW}} | {'Loss':>{W_LOSS}} | {'Total':>{W_TOT}} | {'Score (%)':>{W_SCORE}}"
+        print(header_str)
+        print("-" * TOTAL_WIDTH)
 
-    # Print Yearly Breakdown (Sorted descending by year)
-    for yr in sorted(yearly_buckets.keys(), reverse=True):
-        w, d, l, total, score, score_pct = calculate_stats(yearly_buckets[yr])
-        score_str = f"{score:.1f} ({score_pct:.1f}%)"
-        print(row_fmt.format(str(yr), w, d, l, total, score_str))
+        for tc in active_classes:
+            w, d, l, total, score, score_pct = calculate_stats(tc_dict[tc])
+            score_str = f"{score:.1f} ({score_pct:.1f}%)"
+            row_str = f"  {tc.capitalize():<{W_CLASS - 2}} | {w:>{W_WIN}} | {d:>{W_DRAW}} | {l:>{W_LOSS}} | {total:>{W_TOT}} | {score_str:>{W_SCORE}}"
+            print(row_str)
 
-    print("=======================================================================\n")
+    # Print relative periods
+    for window in ["7 Days", "30 Days", "90 Days", "Year to Date"]:
+        print_section(window, stats[window])
+
+    # Print Yearly Breakdown
+    if stats["Yearly"]:
+        print("\n\n" + "=" * TOTAL_WIDTH)
+        print("  YEARLY BREAKDOWN")
+        print("=" * TOTAL_WIDTH)
+
+        for year in sorted(stats["Yearly"].keys(), reverse=True):
+            print_section(str(year), stats["Yearly"][year])
+
+    print()
 
 if __name__ == "__main__":
     main()
