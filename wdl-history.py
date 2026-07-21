@@ -2,7 +2,7 @@
 """
 wdl-history.py
 Fetches player archive data directly from the Chess.com Public API and tallies 
-Win/Draw/Loss stats and Score % (W + 0.5 * D) across 7d, 30d, 90d, and yearly totals.
+Win/Draw/Loss stats and Score (W + 0.5 * D) with Score % across 7d, 30d, 90d, and yearly totals.
 """
 
 import argparse
@@ -45,17 +45,18 @@ def fetch_json(url):
 
 
 def calculate_stats(games_tally):
-    """Calculates W, D, L, Total, and Score Percentage."""
+    """Calculates W, D, L, Total, Raw Score (W + 0.5*D), and Score Percentage."""
     wins = games_tally.get('W', 0)
     draws = games_tally.get('D', 0)
     losses = games_tally.get('L', 0)
     total = wins + draws + losses
 
     if total == 0:
-        return 0, 0, 0, 0, 0.0
+        return 0, 0, 0, 0, 0.0, 0.0
 
-    score_pct = ((wins + (0.5 * draws)) / total) * 100
-    return wins, draws, losses, total, score_pct
+    raw_score = wins + (0.5 * draws)
+    score_pct = (raw_score / total) * 100
+    return wins, draws, losses, total, raw_score, score_pct
 
 
 def process_player_archives(player_name):
@@ -115,7 +116,7 @@ def process_player_archives(player_name):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch Chess.com archives and tally WDL/Score % for a player."
+        description="Fetch Chess.com archives and tally WDL/Score for a player."
     )
     parser.add_argument("player", nargs="?", help="Chess.com username")
     args = parser.parse_args()
@@ -169,25 +170,27 @@ def main():
     print(f"=======================================================================")
     print(f" Chess.com WDL Performance Summary: {player}")
     print(f"=======================================================================")
-    header_fmt = "{:<20} {:>6} {:>6} {:>6} {:>8} {:>10}"
-    row_fmt    = "{:<20} {:>6} {:>6} {:>6} {:>8} {:>9.1f}%"
+    header_fmt = "{:<20} {:>6} {:>6} {:>6} {:>8} {:>16}"
+    row_fmt    = "{:<20} {:>6} {:>6} {:>6} {:>8} {:>16}"
 
-    print(header_fmt.format("Timeframe", "Win", "Draw", "Loss", "Total", "Score %"))
-    print("-" * 65)
+    print(header_fmt.format("Timeframe", "Win", "Draw", "Loss", "Total", "Score (%)"))
+    print("-" * 68)
 
     # Print Recent Windows
     for label, tally in recent_buckets.items():
-        w, d, l, total, score = calculate_stats(tally)
-        print(row_fmt.format(label, w, d, l, total, score))
+        w, d, l, total, score, score_pct = calculate_stats(tally)
+        score_str = f"{score:.1f} ({score_pct:.1f}%)"
+        print(row_fmt.format(label, w, d, l, total, score_str))
 
-    print("-" * 65)
+    print("-" * 68)
     print(" Yearly History:")
-    print("-" * 65)
+    print("-" * 68)
 
     # Print Yearly Breakdown (Sorted descending by year)
     for yr in sorted(yearly_buckets.keys(), reverse=True):
-        w, d, l, total, score = calculate_stats(yearly_buckets[yr])
-        print(row_fmt.format(str(yr), w, d, l, total, score))
+        w, d, l, total, score, score_pct = calculate_stats(yearly_buckets[yr])
+        score_str = f"{score:.1f} ({score_pct:.1f}%)"
+        print(row_fmt.format(str(yr), w, d, l, total, score_str))
 
     print("=======================================================================\n")
 
