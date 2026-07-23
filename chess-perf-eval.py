@@ -13,6 +13,8 @@ import json
 import math
 import shutil
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 import chess
 import chess.engine
 import chess.pgn
@@ -27,6 +29,34 @@ ANALYSIS_TIME_LIMIT = 5.0     # Hard time limit per move evaluation (seconds)
 # ACPL Filtering Thresholds
 EVAL_CAP_CENTIPAWNS = 400     # Ignore positions evaluated beyond +/- 4.0 pawns (decided games/endgames)
 MAX_SINGLE_MOVE_LOSS = 200    # Cap single-move loss spikes to prevent 1 blunder from ruining game ACPL
+
+# Network Configuration
+MAX_RETRIES = 5
+USER_AGENT = "ChessPerfEval/1.0"
+
+# -----------------------------------------------------------------------------
+# Robust HTTP Session Management
+# -----------------------------------------------------------------------------
+def get_robust_session():
+    """
+    Creates a requests.Session with exponential backoff and retry adapters
+    to handle transient network drops, 429 rate limits, and standard HTTP server errors.
+    """
+    session = requests.Session()
+    retries = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=1.5,  # Backoff delays: 1.5s, 3s, 6s, 12s, 24s
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": USER_AGENT})
+    return session
+
+# Global thread-safe robust session
+HTTP_SESSION = get_robust_session()
 
 # -----------------------------------------------------------------------------
 # Terminal Engine Resolution
@@ -137,14 +167,13 @@ def find_stockfish():
 # -----------------------------------------------------------------------------
 def validate_username(platform_key, username):
     """Verifies with platform API that the user exists."""
-    headers = {"User-Agent": "ChessPerfEval/1.0"}
     if platform_key == "chesscom":
         url = f"https://api.chess.com/pub/player/{username}"
     else:
         url = f"https://lichess.org/api/user/{username}"
 
     try:
-        res = requests.get(url, headers=headers, timeout=5)
+        res = HTTP_SESSION.get(url, timeout=8)
         if res.status_code == 200:
             return True, None
         elif res.status_code == 404:
@@ -156,23 +185,22 @@ def validate_username(platform_key, username):
 
 def is_account_active(platform_key, username):
     """Verifies if an opponent account is active or closed/banned for FPV/TOS."""
-    headers = {"User-Agent": "ChessPerfEval/1.0"}
     if platform_key == "chesscom":
         url = f"https://api.chess.com/pub/player/{username}"
         try:
-            res = requests.get(url, headers=headers, timeout=5)
+            res = HTTP_SESSION.get(url, timeout=8)
             if res.status_code == 200:
                 status = res.json().get("status", "").lower()
                 if "closed" in status:
                     return False, f"Account {status}"
                 return True, "Active"
             return False, f"API HTTP {res.status_code}"
-        except requests.RequestException:
-            return False, "Network error checking status"
+        except requests.RequestException as e:
+            return False, f"Network error checking status ({type(e).__name__})"
     else:  # Lichess
         url = f"https://lichess.org/api/user/{username}"
         try:
-            res = requests.get(url, headers=headers, timeout=5)
+            res = HTTP_SESSION.get(url, timeout=8)
             if res.status_code == 200:
                 data = res.json()
                 if data.get("closed"):
@@ -181,17 +209,16 @@ def is_account_active(platform_key, username):
                     return False, "Fair Play / TOS Violation"
                 return True, "Active"
             return False, f"API HTTP {res.status_code}"
-        except requests.RequestException:
-            return False, "Network error checking status"
+        except requests.RequestException as e:
+            return False, f"Network error checking status ({type(e).__name__})"
 
 def fetch_chesscom_games(username, speed_class, num_games=25):
     """Fetches PGNs from Chess.com traversing monthly archives."""
     archives_url = f"https://api.chess.com/pub/player/{username}/games/archives"
-    headers = {"User-Agent": "ChessPerfEval/1.0"}
     
     print(f"\nFetching up to {num_games} {speed_class.upper()} games from Chess.com archives for '{username}'...")
     try:
-        res = requests.get(archives_url, headers=headers, timeout=10)
+        res = HTTP_SESSION.get(archives_url, timeout=10)
         if res.status_code != 200:
             print(f"Error fetching Chess.com archives for '{username}'")
             return []
@@ -202,7 +229,7 @@ def fetch_chesscom_games(username, speed_class, num_games=25):
 
         matched_games = []
         for archive_url in reversed(archives):
-            game_res = requests.get(archive_url, headers=headers, timeout=10)
+            game_res = HTTP_SESSION.get(archive_url, timeout=10)
             if game_res.status_code != 200:
                 continue
                 
@@ -226,11 +253,10 @@ def fetch_chesscom_games(username, speed_class, num_games=25):
 def fetch_lichess_games(username, speed_class, num_games=25):
     """Fetches PGNs from Lichess filtering server-side by perfType."""
     url = f"https://lichess.org/api/games/user/{username}?max={num_games}&perfType={speed_class}"
-    headers = {"Accept": "application/x-chess-pgn"}
     
     print(f"\nFetching last {num_games} {speed_class.upper()} games from Lichess for '{username}'...")
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = HTTP_SESSION.get(url, headers={"Accept": "application/x-chess-pgn"}, timeout=10)
         if response.status_code != 200:
             print(f"Error fetching Lichess games: HTTP {response.status_code}")
             return []
