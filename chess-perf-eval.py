@@ -154,6 +154,36 @@ def validate_username(platform_key, username):
     except requests.RequestException as e:
         return False, f"Network error validating user: {e}"
 
+def is_account_active(platform_key, username):
+    """Verifies if an opponent account is active or closed/banned for FPV/TOS."""
+    headers = {"User-Agent": "ChessPerfEval/1.0"}
+    if platform_key == "chesscom":
+        url = f"https://api.chess.com/pub/player/{username}"
+        try:
+            res = requests.get(url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                status = res.json().get("status", "").lower()
+                if "closed" in status:
+                    return False, f"Account {status}"
+                return True, "Active"
+            return False, f"API HTTP {res.status_code}"
+        except requests.RequestException:
+            return False, "Network error checking status"
+    else:  # Lichess
+        url = f"https://lichess.org/api/user/{username}"
+        try:
+            res = requests.get(url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("closed"):
+                    return False, "Account Closed"
+                if data.get("tosViolation"):
+                    return False, "Fair Play / TOS Violation"
+                return True, "Active"
+            return False, f"API HTTP {res.status_code}"
+        except requests.RequestException:
+            return False, "Network error checking status"
+
 def fetch_chesscom_games(username, speed_class, num_games=25):
     """Fetches PGNs from Chess.com traversing monthly archives."""
     archives_url = f"https://api.chess.com/pub/player/{username}/games/archives"
@@ -535,16 +565,35 @@ def main():
             opp_str = f"vs {opp_res['name']} ({opp_res['rating']})" if opp_res else "vs Opponent"
             print(f"[{idx:02d}/{len(games)}] {opp_str} | Decisions: {target_res['decisions']:2d} | Top-1: {g_match:5.1f}% | ACPL: {g_acpl:5.1f}")
             
+            # HARVEST OPPONENT DATA WITH EXPLICIT CHECKS & CLEAR REJECTION LOGGING
             if opp_res:
-                o_ratings.append(opp_res["rating"])
-                o_decisions += opp_res["decisions"]
-                o_matches += opp_res["matches"]
-                o_cp_loss += opp_res["cp_loss"]
-                peer_cp_all.extend(opp_res["cp_list"])
-                peer_match_all.extend(opp_res["match_list"])
-                
-                harvested_opponents.add(opp_res["name"])
-                print(f"       └──> Opponent '{opp_res['name']}' ({opp_res['rating']}) harvested into peer baseline!")
+                opp_name = opp_res["name"]
+                opp_clean = opp_name.strip().lower()
+                opp_rating = opp_res["rating"]
+                target_rating = target_res["rating"]
+
+                # 1. Deduplication Check
+                if opp_clean in harvested_opponents:
+                    print(f"       └──> [PEER SKIPPED] Opponent '{opp_name}' is a duplicate (already in baseline).")
+
+                # 2. Rating Window Check (+/- 150 ELO)
+                elif abs(opp_rating - target_rating) > 150:
+                    print(f"       └──> [PEER SKIPPED] Opponent '{opp_name}' ({opp_rating}) outside rating window (+/- 150).")
+
+                # 3. Account Status Check (Fair Play / TOS bans)
+                else:
+                    active, status_reason = is_account_active(platform_key, opp_name)
+                    if not active:
+                        print(f"       └──> [PEER EXCLUDED] Opponent '{opp_name}' - {status_reason}")
+                    else:
+                        harvested_opponents.add(opp_clean)
+                        o_ratings.append(opp_rating)
+                        o_decisions += opp_res["decisions"]
+                        o_matches += opp_res["matches"]
+                        o_cp_loss += opp_res["cp_loss"]
+                        peer_cp_all.extend(opp_res["cp_list"])
+                        peer_match_all.extend(opp_res["match_list"])
+                        print(f"       └──> [PEER HARVESTED] Opponent '{opp_name}' ({opp_rating}) added to peer baseline!")
 
     engine.quit()
 
