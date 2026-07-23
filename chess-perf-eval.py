@@ -3,7 +3,7 @@
 chess-perf-eval.py
 A terminal-native performance comparator tool that analyzes player games against 
 local Stockfish engine baselines using direct opponent harvesting, filtered ACPL stats,
-and empirical Z-score statistical diagnostics.
+global baseline fallback generation, and empirical Z-score statistical diagnostics.
 """
 
 import io
@@ -12,6 +12,7 @@ import sys
 import json
 import math
 import shutil
+import random
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
@@ -30,9 +31,13 @@ ANALYSIS_TIME_LIMIT = 5.0     # Hard time limit per move evaluation (seconds)
 EVAL_CAP_CENTIPAWNS = 400     # Ignore positions evaluated beyond +/- 4.0 pawns (decided games/endgames)
 MAX_SINGLE_MOVE_LOSS = 200    # Cap single-move loss spikes to prevent 1 blunder from ruining game ACPL
 
+# Baseline Harvesting Limits
+RATING_WINDOW = 150           # Initial direct peer search window (+/- 150 ELO)
+MIN_PEER_DECISIONS = 200      # Strictly enforced minimum decision moves required for statistical validity
+
 # Network Configuration
 MAX_RETRIES = 5
-USER_AGENT = "ChessPerfEval/1.0"
+USER_AGENT = "ChessPerfEval/1.0 (Contact: local_script_user)"
 
 # -----------------------------------------------------------------------------
 # Robust HTTP Session Management
@@ -274,6 +279,75 @@ def fetch_lichess_games(username, speed_class, num_games=25):
         return []
 
 # -----------------------------------------------------------------------------
+# Secondary Baseline Fallback Generator (Global Peer Pool)
+# -----------------------------------------------------------------------------
+def fetch_global_peer_games(platform_key, target_elo, speed_class, exclude_set, required_games=25):
+    """
+    Fallback mechanism when direct opponent harvesting yields insufficient baseline data.
+    Queries active public players sitting within target_elo +/- 200 to extract games.
+    """
+    print(f"\n[!] Direct opponent harvest below minimum threshold ({MIN_PEER_DECISIONS} moves).")
+    print(f"[*] Initializing Global Peer Fallback Generator...")
+    print(f"[*] Targeting active rating bracket: ~{target_elo} ELO on {platform_key.capitalize()} ({speed_class.upper()})...")
+
+    fallback_games = []
+    harvested_usernames = set()
+
+    if platform_key == "chesscom":
+        leaderboard_url = "https://api.chess.com/pub/leaderboards"
+        try:
+            res = HTTP_SESSION.get(leaderboard_url, timeout=10)
+            candidate_pool = []
+            if res.status_code == 200:
+                data = res.json()
+                for player in data.get("live_rapid", []) + data.get("live_blitz", []):
+                    uname = player.get("username", "")
+                    if uname.lower() not in exclude_set:
+                        candidate_pool.append(uname)
+            
+            random.shuffle(candidate_pool)
+            for user in candidate_pool:
+                if len(fallback_games) >= required_games:
+                    break
+                
+                stats_url = f"https://api.chess.com/pub/player/{user}/stats"
+                st_res = HTTP_SESSION.get(stats_url, timeout=6)
+                if st_res.status_code == 200:
+                    st_data = st_res.json()
+                    tc_key = f"chess_{speed_class}"
+                    last_rating = st_data.get(tc_key, {}).get("last", {}).get("rating", 0)
+                    
+                    if abs(last_rating - target_elo) <= 200:
+                        u_games = fetch_chesscom_games(user, speed_class, num_games=3)
+                        for g in u_games:
+                            fallback_games.append((user, g))
+                            harvested_usernames.add(user.lower())
+                            if len(fallback_games) >= required_games:
+                                break
+        except Exception as e:
+            print(f"[!] Error fetching fallback global pool: {e}")
+
+    else:  # Lichess
+        url = f"https://lichess.org/api/tv/channels"
+        try:
+            res = HTTP_SESSION.get(url, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                for channel, details in data.items():
+                    user = details.get("user", {}).get("name", "")
+                    if user and user.lower() not in exclude_set:
+                        u_games = fetch_lichess_games(user, speed_class, num_games=3)
+                        for g in u_games:
+                            fallback_games.append((user, g))
+                            harvested_usernames.add(user.lower())
+                            if len(fallback_games) >= required_games:
+                                break
+        except Exception as e:
+            print(f"[!] Error fetching Lichess fallback pool: {e}")
+
+    return fallback_games, harvested_usernames
+
+# -----------------------------------------------------------------------------
 # Dual Player Game Analysis Engine (Target + Opponent Harvesting)
 # -----------------------------------------------------------------------------
 def analyze_game_and_harvest(game, target_user, engine):
@@ -310,7 +384,14 @@ def analyze_game_and_harvest(game, target_user, engine):
         except ValueError:
             target_rating, opp_rating = 1500, 1500
     else:
-        return None, None
+        target_color = chess.WHITE
+        opp_color = chess.BLACK
+        opp_name = black_name
+        try:
+            target_rating = int(headers.get("WhiteElo", 1500))
+            opp_rating = int(headers.get("BlackElo", 1500))
+        except ValueError:
+            target_rating, opp_rating = 1500, 1500
 
     board = game.board()
     move_count = 0
@@ -418,7 +499,8 @@ def compute_z_statistics(target_cp, peer_cp, target_match, peer_match):
     n_t = len(target_cp)
     n_p = len(peer_cp)
     
-    if n_t < 30 or n_p < 30:
+    # Strictly require 200+ decisions on BOTH sides for Z-test computation
+    if n_t < MIN_PEER_DECISIONS or n_p < MIN_PEER_DECISIONS:
         return None
 
     # 1. ACPL Precision Z-Score
@@ -428,7 +510,6 @@ def compute_z_statistics(target_cp, peer_cp, target_match, peer_match):
     var_acpl_p = calculate_sample_variance(peer_cp)
     
     se_acpl = math.sqrt((var_acpl_t / n_t) + (var_acpl_p / n_p))
-    # Note: Lower ACPL is better, so (peer - target) makes positive Z an overperformance
     z_acpl = (mean_acpl_p - mean_acpl_t) / se_acpl if se_acpl > 0 else 0.0
 
     # 2. Top-1 Match Rate Z-Score (Two-proportion / Binomial model)
@@ -562,7 +643,7 @@ def main():
             print(f"Tip: Delete local '{CONFIG_FILE}' to reset the saved path.")
         return
 
-    print(f"\nEvaluating target games & harvesting opponent performance (Depth={ANALYSIS_DEPTH})...")
+    print(f"\nEvaluating target games & harvesting opponent performance (Depth={ANALYSIS_DEPTH}, Max Time={ANALYSIS_TIME_LIMIT}s/move)...")
     print(f"Filters Active: Ignoring positions > |{EVAL_CAP_CENTIPAWNS/100:.1f}| CP | Bounding single-move loss at {MAX_SINGLE_MOVE_LOSS} CP.\n")
 
     t_decisions, t_matches, t_cp_loss = 0, 0, 0
@@ -574,6 +655,8 @@ def main():
     target_match_all, peer_match_all = [], []
     
     harvested_opponents = set()
+    target_clean = username.strip().lower()
+    harvested_opponents.add(target_clean)
 
     for idx, game in enumerate(games, start=1):
         target_res, opp_res = analyze_game_and_harvest(game, username, engine)
@@ -603,8 +686,8 @@ def main():
                     print(f"       └──> [PEER SKIPPED] Opponent '{opp_name}' is a duplicate (already in baseline).")
 
                 # 2. Rating Window Check (+/- 150 ELO)
-                elif abs(opp_rating - target_rating) > 150:
-                    print(f"       └──> [PEER SKIPPED] Opponent '{opp_name}' ({opp_rating}) outside rating window (+/- 150).")
+                elif abs(opp_rating - target_rating) > RATING_WINDOW:
+                    print(f"       └──> [PEER SKIPPED] Opponent '{opp_name}' ({opp_rating}) outside rating window (+/- {RATING_WINDOW}).")
 
                 # 3. Account Status Check (Fair Play / TOS bans)
                 else:
@@ -621,6 +704,35 @@ def main():
                         peer_match_all.extend(opp_res["match_list"])
                         print(f"       └──> [PEER HARVESTED] Opponent '{opp_name}' ({opp_rating}) added to peer baseline!")
 
+    # SECONDARY FALLBACK TRIGGER: If direct peer decisions < MIN_PEER_DECISIONS (200 moves)
+    if o_decisions < MIN_PEER_DECISIONS and len(t_ratings) > 0:
+        avg_target_elo = int(sum(t_ratings) / len(t_ratings))
+        
+        # Lock target user into exclusion set before pulling global pool
+        harvested_opponents.add(target_clean)
+        
+        fallback_games, fallback_users = fetch_global_peer_games(
+            platform_key, avg_target_elo, speed_class, harvested_opponents, required_games=25
+        )
+        
+        for p_user, f_game in fallback_games:
+            p_clean = p_user.strip().lower()
+            
+            # PREVENT DUPLICATES & SELF-HARVESTING
+            if p_clean in harvested_opponents:
+                continue
+                
+            p_target_res, p_opp_res = analyze_game_and_harvest(f_game, p_user, engine)
+            if p_target_res:
+                harvested_opponents.add(p_clean)  # Lock candidate immediately to prevent duplicate game logs
+                o_ratings.append(p_target_res["rating"])
+                o_decisions += p_target_res["decisions"]
+                o_matches += p_target_res["matches"]
+                o_cp_loss += p_target_res["cp_loss"]
+                peer_cp_all.extend(p_target_res["cp_list"])
+                peer_match_all.extend(p_target_res["match_list"])
+                print(f"       └──> [GLOBAL PEER HARVESTED] Active rating-matched peer '{p_user}' ({p_target_res['rating']}) injected into baseline!")
+
     engine.quit()
 
     if t_decisions == 0:
@@ -635,15 +747,18 @@ def main():
     peer_match_rate = (o_matches / o_decisions) * 100 if o_decisions > 0 else 0.0
     peer_acpl = o_cp_loss / o_decisions if o_decisions > 0 else 0.0
     
-    min_peer_r = min(o_ratings) if o_ratings else avg_target_rating - 150
-    max_peer_r = max(o_ratings) if o_ratings else avg_target_rating + 150
+    min_peer_r = min(o_ratings) if o_ratings else avg_target_rating - RATING_WINDOW
+    max_peer_r = max(o_ratings) if o_ratings else avg_target_rating + RATING_WINDOW
+
+    # Adjust peer dataset count display to exclude target player
+    display_peer_count = len(harvested_opponents - {target_clean})
 
     print("\n" + "=" * 60)
     print(f" EMPIRICAL EVALUATION REPORT: {username}")
     print("=" * 60)
     print(f" Platform / Time Control : {platform_key.capitalize()} ({speed_class.upper()})")
     print(f" Target Player Games     : {len(t_ratings)} games / {t_decisions} decisions")
-    print(f" Peer Dataset Size       : {len(harvested_opponents)} active opponents / {o_decisions} decisions")
+    print(f" Peer Dataset Size       : {display_peer_count} active opponents / {o_decisions} decisions")
     print(f" Peer Rating Window      : [{min_peer_r} to {max_peer_r}]")
     print("-" * 60)
     print(" PERFORMANCE METRICS      |  TARGET PLAYER  | REAL PEER BASELINE")
@@ -660,7 +775,7 @@ def main():
     print(f" • Match Rate Delta : {match_delta:+.1f}% vs direct peer sample")
     print(f" • Precision Delta  : {acpl_delta:+.1f} ACPL vs direct peer sample")
 
-    # Z-Score Computation
+    # Z-Score Computation Guardrail
     z_stats = compute_z_statistics(target_cp_all, peer_cp_all, target_match_all, peer_match_all)
     
     print("-" * 60)
@@ -685,7 +800,17 @@ def main():
         else:
             print(" [🔥] ANOMALOUS OVERPERFORMANCE (Z >= +5.0): Performance is statistically incompatible with peer baseline.")
     else:
-        print(" [!] Insufficient decision volume (minimum 30 non-forced moves required per side for Z-test).")
+        print(f" [!] INSUFFICIENT DECISION VOLUME FOR Z-TEST")
+        print(f"     • Target Player Decisions : {t_decisions} moves (Required: {MIN_PEER_DECISIONS}+)")
+        print(f"     • Peer Baseline Decisions : {o_decisions} moves (Required: {MIN_PEER_DECISIONS}+)")
+        
+        if num_games < 100:
+            print(f"\n [DIAGNOSTIC]: The requested sample of {num_games} games yielded under {MIN_PEER_DECISIONS} non-forced decisions.")
+            print(f"              Consider selecting a larger sample size (e.g., 50 or 100 games).")
+        else:
+            print(f"\n [DIAGNOSTIC]: The maximum sample size of {num_games} games yielded under {MIN_PEER_DECISIONS} non-forced decisions.")
+            print(f"              Insufficient move volume available in this game set to perform a valid Z-test.")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()
