@@ -5,9 +5,10 @@ A collection of terminal Python scripts for analyzing Chess.com account data, PG
 ## Included Tools
 
 * **cc_archive_splitter**: Splits Chess.com monthly archive PGNs into separate categorized PGN files based on time control and game type.
+* **chess-perf-eval.py**: Aanalyzes player games against local Stockfish engine baselines using direct opponent harvesting, filtered ACPL stats, and empirical Z-score statistical diagnostics.
 * **chess_archive_parser**: Downloads monthly PGN archives for a given username, extracts unique opponents, queries account statuses, and categorizes closed accounts. Outputs text and sql friendly csv files
-* **wdl-history.py**: Parses game history to generate Win/Draw/Loss trends and breakdown metrics for a given player name.
 * **opponent-accuracy.py**: Analyzes opponent play metrics and performance accuracy across archives for a given player name.
+* **wdl-history.py**: Parses game history to generate Win/Draw/Loss trends and breakdown metrics for a given player name.
 
 ## Usage
 
