@@ -567,19 +567,35 @@ def prompt_username(platform_key):
             print(f"[X] {err_msg} Please try again.")
 
 def prompt_time_control(platform_key):
-    """Prompts for time control with strict option validation."""
-    print("\nSelect Primary Time Control to evaluate:")
-    print(" 1. Blitz (Default)")
-    print(" 2. Rapid")
-    print(" 3. Bullet")
-    print(" 4. Daily / Classical")
-    
-    tc_map = {
-        "1": "blitz",
-        "2": "rapid",
-        "3": "bullet",
-        "4": "daily" if platform_key == "chesscom" else "classical"
-    }
+    """Prompts for time control with clean, platform-native menus."""
+    if platform_key == "chesscom":
+        print("\nSelect Chess.com Time Control:")
+        print(" 1. Blitz [Default]")
+        print(" 2. Rapid")
+        print(" 3. Bullet")
+        print(" 4. Daily")
+        
+        tc_map = {
+            "1": "blitz",
+            "2": "rapid",
+            "3": "bullet",
+            "4": "daily"
+        }
+    else:  # Lichess
+        print("\nSelect Lichess Time Control:")
+        print(" 1. Blitz [Default]")
+        print(" 2. Rapid")
+        print(" 3. Bullet")
+        print(" 4. Classical")
+        print(" 5. Correspondence")
+        
+        tc_map = {
+            "1": "blitz",
+            "2": "rapid",
+            "3": "bullet",
+            "4": "classical",
+            "5": "correspondence"
+        }
     
     while True:
         tc_input = input("Choice [Default: 1]: ").strip()
@@ -587,7 +603,8 @@ def prompt_time_control(platform_key):
             return "blitz"
         if tc_input in tc_map:
             return tc_map[tc_input]
-        print("[X] Invalid choice. Please enter a number between 1 and 4.")
+            
+        print(f"[X] Invalid choice. Please enter a number between 1 and {len(tc_map)}.")
 
 def prompt_sample_size():
     """Prompts for sample size strictly bounded between 25 and 100."""
