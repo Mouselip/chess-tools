@@ -1,6 +1,6 @@
 # Chess Tools
 
-A collection of terminal Python scripts for analyzing Chess.com account data, PGN archives, and player statistics.
+A collection of terminal Python scripts for analyzing Chess.com (and sometimes Lichess.org) account data, PGN archives, and player statistics.
 
 NOTE: I "shebang" all of my scripts with "#!/usr/bin/env python3"
 This is so I can put them in my path and just run them from anywhere. If you do not use a separate environment for python then you may want to remove the shebang and run them with "python \<script-name\>" or update the shebang for your system. I am a Linux guy so I do not know how to configure the running of these scripts in Mac or Windows.
