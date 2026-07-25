@@ -3,7 +3,7 @@
 A collection of terminal Python scripts for analyzing Chess.com account data, PGN archives, and player statistics.
 
 NOTE: I "shebang" all of my scripts with "#!/usr/bin/env python3"
-This is so I can put them in my path and just run them from anywhere. If you do not use a spearate environment for python then you may want to remove the shebang and run them with "python <script-name>"
+This is so I can put them in my path and just run them from anywhere. If you do not use a separate environment for python then you may want to remove the shebang and run them with "python <script-name>"
 
 ## Included Tools
 
