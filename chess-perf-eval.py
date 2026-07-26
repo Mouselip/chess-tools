@@ -13,6 +13,7 @@ import json
 import math
 import shutil
 import random
+from collections import Counter
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
@@ -21,19 +22,21 @@ import chess.engine
 import chess.pgn
 
 # System Configuration
-# Always write and check config in the CURRENT WORKING DIRECTORY where the command is run
 CONFIG_FILE = os.path.join(os.getcwd(), "engine_config.json")
 
 ANALYSIS_DEPTH = 18           # High precision target depth
 ANALYSIS_TIME_LIMIT = 5.0     # Hard time limit per move evaluation (seconds)
 
+# Opening Cutoff
+OPENING_BOOK_PLIES = 12       # Skip first 6 full moves (12 half-moves)
+
 # ACPL Filtering Thresholds
-EVAL_CAP_CENTIPAWNS = 400     # Ignore positions evaluated beyond +/- 4.0 pawns (decided games/endgames)
+EVAL_CAP_CENTIPAWNS = 400     # Ignore positions evaluated beyond +/- 400 CP (4.0 pawns)
 MAX_SINGLE_MOVE_LOSS = 200    # Cap single-move loss spikes to prevent 1 blunder from ruining game ACPL
 
 # Baseline Harvesting Limits
 RATING_WINDOW = 150           # Initial direct peer search window (+/- 150 ELO)
-MIN_PEER_DECISIONS = 200      # Strictly enforced minimum decision moves required for statistical validity
+MIN_PEER_DECISIONS = 200      # Strictly required decision count for valid Welch's Z-test
 
 # Network Configuration
 MAX_RETRIES = 5
@@ -50,7 +53,7 @@ def get_robust_session():
     session = requests.Session()
     retries = Retry(
         total=MAX_RETRIES,
-        backoff_factor=1.5,  # Backoff delays: 1.5s, 3s, 6s, 12s, 24s
+        backoff_factor=1.5,
         status_forcelist=[429, 500, 502, 503, 504],
         raise_on_status=False
     )
@@ -60,7 +63,6 @@ def get_robust_session():
     session.headers.update({"User-Agent": USER_AGENT})
     return session
 
-# Global thread-safe robust session
 HTTP_SESSION = get_robust_session()
 
 # -----------------------------------------------------------------------------
@@ -80,7 +82,7 @@ def load_saved_engine_path():
     return None
 
 def save_engine_path(path):
-    """Saves Stockfish path to engine_config.json in the current working directory."""
+    """Saves Stockfish path to engine_config.json in current working directory."""
     try:
         config_data = {"stockfish_path": os.path.abspath(path)}
         with open(CONFIG_FILE, "w") as f:
@@ -128,13 +130,7 @@ def prompt_terminal_path_input():
             print(f"[X] Invalid file path: '{user_input}'. Please try again.\n")
 
 def find_stockfish():
-    """
-    4-Tier Terminal Resolution Strategy:
-    1. Saved config in current working directory (engine_config.json)
-    2. Environment variable (STOCKFISH_PATH)
-    3. Auto-detection ($PATH, current folder, standard Linux/Mac paths)
-    4. Terminal prompt fallback
-    """
+    """Resolves Stockfish executable via saved config, ENV, system PATH, or prompt."""
     saved = load_saved_engine_path()
     if saved:
         return saved
@@ -217,145 +213,123 @@ def is_account_active(platform_key, username):
         except requests.RequestException as e:
             return False, f"Network error checking status ({type(e).__name__})"
 
-def fetch_chesscom_games(username, speed_class, num_games=25):
-    """Fetches PGNs from Chess.com traversing monthly archives."""
-    archives_url = f"https://api.chess.com/pub/player/{username}/games/archives"
-    
-    print(f"\nFetching up to {num_games} {speed_class.upper()} games from Chess.com archives for '{username}'...")
-    try:
-        res = HTTP_SESSION.get(archives_url, timeout=10)
-        if res.status_code != 200:
-            print(f"Error fetching Chess.com archives for '{username}'")
-            return []
-            
-        archives = res.json().get("archives", [])
-        if not archives:
-            return []
-
-        matched_games = []
-        for archive_url in reversed(archives):
-            game_res = HTTP_SESSION.get(archive_url, timeout=10)
-            if game_res.status_code != 200:
-                continue
-                
-            data = game_res.json().get("games", [])
-            for g in reversed(data):
-                tc_class = g.get("time_class", "")
-                
-                if tc_class == speed_class:
-                    pgn_io = io.StringIO(g.get("pgn", ""))
-                    game = chess.pgn.read_game(pgn_io)
-                    if game:
-                        matched_games.append(game)
-                        if len(matched_games) >= num_games:
-                            return matched_games
-                            
-        return matched_games
-    except requests.RequestException as e:
-        print(f"Network error fetching games: {e}")
-        return []
-
-def fetch_lichess_games(username, speed_class, num_games=25):
-    """Fetches PGNs from Lichess filtering server-side by perfType."""
-    url = f"https://lichess.org/api/games/user/{username}?max={num_games}&perfType={speed_class}"
-    
-    print(f"\nFetching last {num_games} {speed_class.upper()} games from Lichess for '{username}'...")
-    try:
-        response = HTTP_SESSION.get(url, headers={"Accept": "application/x-chess-pgn"}, timeout=10)
-        if response.status_code != 200:
-            print(f"Error fetching Lichess games: HTTP {response.status_code}")
-            return []
-            
-        games = []
-        pgn_text = io.StringIO(response.text)
-        while len(games) < num_games:
-            game = chess.pgn.read_game(pgn_text)
-            if game is None:
-                break
-            games.append(game)
-        return games
-    except requests.RequestException as e:
-        print(f"Network error fetching games: {e}")
-        return []
-
 # -----------------------------------------------------------------------------
-# Secondary Baseline Fallback Generator (Global Peer Pool)
+# Specific Time Control Auto-Detector
 # -----------------------------------------------------------------------------
-def fetch_global_peer_games(platform_key, target_elo, speed_class, exclude_set, required_games=25):
+def find_most_frequent_time_control(platform_key, username, speed_class):
     """
-    Fallback mechanism when direct opponent harvesting yields insufficient baseline data.
-    Queries active public players sitting within target_elo +/- 200 to extract games.
+    Parses recent archive games strictly within the selected speed category 
+    (e.g., 'rapid', 'blitz') to find the single most frequently played exact time control
+    (e.g., '15+10', '600', '180+2').
     """
-    print(f"\n[!] Direct opponent harvest below minimum threshold ({MIN_PEER_DECISIONS} moves).")
-    print(f"[*] Initializing Global Peer Fallback Generator...")
-    print(f"[*] Targeting active rating bracket: ~{target_elo} ELO on {platform_key.capitalize()} ({speed_class.upper()})...")
-
-    fallback_games = []
-    harvested_usernames = set()
+    print(f"\nScanning recent archives for category '{speed_class.upper()}' to detect primary time control...")
+    tc_counter = Counter()
 
     if platform_key == "chesscom":
-        leaderboard_url = "https://api.chess.com/pub/leaderboards"
+        archives_url = f"https://api.chess.com/pub/player/{username}/games/archives"
         try:
-            res = HTTP_SESSION.get(leaderboard_url, timeout=10)
-            candidate_pool = []
+            res = HTTP_SESSION.get(archives_url, timeout=10)
             if res.status_code == 200:
-                data = res.json()
-                for player in data.get("live_rapid", []) + data.get("live_blitz", []):
-                    uname = player.get("username", "")
-                    if uname.lower() not in exclude_set:
-                        candidate_pool.append(uname)
-            
-            random.shuffle(candidate_pool)
-            for user in candidate_pool:
-                if len(fallback_games) >= required_games:
-                    break
-                
-                stats_url = f"https://api.chess.com/pub/player/{user}/stats"
-                st_res = HTTP_SESSION.get(stats_url, timeout=6)
-                if st_res.status_code == 200:
-                    st_data = st_res.json()
-                    tc_key = f"chess_{speed_class}"
-                    last_rating = st_data.get(tc_key, {}).get("last", {}).get("rating", 0)
-                    
-                    if abs(last_rating - target_elo) <= 200:
-                        u_games = fetch_chesscom_games(user, speed_class, num_games=3)
-                        for g in u_games:
-                            fallback_games.append((user, g))
-                            harvested_usernames.add(user.lower())
-                            if len(fallback_games) >= required_games:
-                                break
-        except Exception as e:
-            print(f"[!] Error fetching fallback global pool: {e}")
+                archives = res.json().get("archives", [])
+                for archive_url in reversed(archives):
+                    game_res = HTTP_SESSION.get(archive_url, timeout=10)
+                    if game_res.status_code != 200:
+                        continue
+                    data = game_res.json().get("games", [])
+                    for g in data:
+                        if g.get("time_class", "").lower() == speed_class.lower():
+                            raw_tc = g.get("time_control", "")
+                            if raw_tc:
+                                tc_counter[raw_tc] += 1
+                    if sum(tc_counter.values()) >= 50:
+                        break
+        except requests.RequestException as e:
+            print(f"Error auto-detecting time control: {e}")
 
     else:  # Lichess
-        url = f"https://lichess.org/api/tv/channels"
+        url = f"https://lichess.org/api/games/user/{username}?max=50&perfType={speed_class}"
         try:
-            res = HTTP_SESSION.get(url, timeout=10)
+            res = HTTP_SESSION.get(url, headers={"Accept": "application/x-chess-pgn"}, timeout=10)
             if res.status_code == 200:
-                data = res.json()
-                for channel, details in data.items():
-                    user = details.get("user", {}).get("name", "")
-                    if user and user.lower() not in exclude_set:
-                        u_games = fetch_lichess_games(user, speed_class, num_games=3)
-                        for g in u_games:
-                            fallback_games.append((user, g))
-                            harvested_usernames.add(user.lower())
-                            if len(fallback_games) >= required_games:
-                                break
-        except Exception as e:
-            print(f"[!] Error fetching Lichess fallback pool: {e}")
+                pgn_text = io.StringIO(res.text)
+                while True:
+                    game = chess.pgn.read_game(pgn_text)
+                    if game is None:
+                        break
+                    tc_header = game.headers.get("TimeControl", "")
+                    if tc_header:
+                        tc_counter[tc_header] += 1
+        except requests.RequestException as e:
+            print(f"Error auto-detecting time control: {e}")
 
-    return fallback_games, harvested_usernames
+    if tc_counter:
+        top_tc, count = tc_counter.most_common(1)[0]
+        print(f"[+] Primary time control detected in '{speed_class.upper()}': '{top_tc}' ({count} recent games).")
+        return top_tc
+
+    print(f"[!] Could not determine specific time control for '{speed_class.upper()}'. Harvesting all games in category.")
+    return None
 
 # -----------------------------------------------------------------------------
-# Dual Player Game Analysis Engine (Target + Opponent Harvesting)
+# Game Harvesting Streamer
+# -----------------------------------------------------------------------------
+def stream_games(platform_key, username, speed_class, exact_tc=None):
+    """
+    Generator function that streams matching PGN games sequentially from archives
+    to allow bucket-filling by decision count.
+    """
+    if platform_key == "chesscom":
+        archives_url = f"https://api.chess.com/pub/player/{username}/games/archives"
+        try:
+            res = HTTP_SESSION.get(archives_url, timeout=10)
+            if res.status_code != 200:
+                return
+            archives = res.json().get("archives", [])
+            for archive_url in reversed(archives):
+                game_res = HTTP_SESSION.get(archive_url, timeout=10)
+                if game_res.status_code != 200:
+                    continue
+                data = game_res.json().get("games", [])
+                for g in reversed(data):
+                    tc_class = g.get("time_class", "")
+                    tc_control = g.get("time_control", "")
+                    if tc_class.lower() == speed_class.lower():
+                        if exact_tc and tc_control != exact_tc:
+                            continue
+                        pgn_io = io.StringIO(g.get("pgn", ""))
+                        game = chess.pgn.read_game(pgn_io)
+                        if game:
+                            yield game
+        except requests.RequestException as e:
+            print(f"Network error streaming games: {e}")
+            return
+    else:  # Lichess
+        url = f"https://lichess.org/api/games/user/{username}?perfType={speed_class}"
+        try:
+            response = HTTP_SESSION.get(url, headers={"Accept": "application/x-chess-pgn"}, stream=True, timeout=10)
+            if response.status_code != 200:
+                return
+            pgn_text = io.StringIO(response.text)
+            while True:
+                game = chess.pgn.read_game(pgn_text)
+                if game is None:
+                    break
+                tc_header = game.headers.get("TimeControl", "")
+                if exact_tc and tc_header != exact_tc:
+                    continue
+                yield game
+        except requests.RequestException as e:
+            print(f"Network error streaming games: {e}")
+            return
+
+# -----------------------------------------------------------------------------
+# Dual Player Game Analysis Engine
 # -----------------------------------------------------------------------------
 def analyze_game_and_harvest(game, target_user, engine):
     """
-    Analyzes critical non-forced decisions for BOTH the target player and their opponent.
-    Filters out opening book moves, forced moves, lopsided/decided positions (>4.0 CP),
-    and caps single-move loss spikes at 200 CP.
-    Returns per-decision decision vectors for exact variance and Z-score processing.
+    Analyzes critical non-forced decisions for BOTH target player and opponent.
+    Filters out opening book (first 6 full moves/12 plies), forced moves,
+    lopsided/decided positions (>400 CP / 4.0 pawns), and caps single-move loss at 200 CP.
     """
     headers = game.headers
     white_name = headers.get("White", "")
@@ -406,8 +380,8 @@ def analyze_game_and_harvest(game, target_user, engine):
         current_turn = board.turn
         move_count += 1
 
-        # 1. Skip opening book (first 10 full moves / 20 half-moves)
-        if move_count <= 20:
+        # 1. Skip opening book (first 6 full moves / 12 half-moves)
+        if move_count <= OPENING_BOOK_PLIES:
             board.push(move)
             continue
 
@@ -430,7 +404,7 @@ def analyze_game_and_harvest(game, target_user, engine):
             
         cp_before = score_before.score(mate_score=10000)
         
-        # 4. Filter out decided/lopsided positions (>4.0 pawns eval advantage or disadvantage)
+        # 4. Filter out decided/lopsided positions (>400 CP / 4.0 pawns)
         if abs(cp_before) > EVAL_CAP_CENTIPAWNS:
             board.push(move)
             continue
@@ -477,29 +451,17 @@ def calculate_sample_variance(data_list):
     mean = sum(data_list) / n
     return sum((x - mean) ** 2 for x in data_list) / (n - 1)
 
-def erfc(x):
-    """Approximation of complementary error function for p-value calculation."""
-    # Abramowitz and Stegun formula 7.1.26
-    a1, a2, a3, a4, a5 = 0.0705230784, 0.0422820123, 0.0092705272, 0.0001520143, 0.0002765672, 0.0000430638
-    t = 1.0 / (1.0 + a1 * x + a2 * (x**2) + a3 * (x**3) + a4 * (x**4) + a5 * (x**5) + 0.0000430638 * (x**6))
-    return t ** 16
-
 def z_to_p_value(z_score):
     """Converts a positive Z-score to a one-tailed p-value."""
     if z_score <= 0:
         return 0.5
-    # Standard normal cumulative distribution approximation
     return 0.5 * math.erfc(z_score / math.sqrt(2))
 
 def compute_z_statistics(target_cp, peer_cp, target_match, peer_match):
-    """
-    Computes two-sample Z-scores and standard errors comparing target vs peer pool.
-    Positive Z = Target outperformed peer baseline.
-    """
+    """Computes two-sample Welch's Z-scores and standard errors."""
     n_t = len(target_cp)
     n_p = len(peer_cp)
     
-    # Strictly require 200+ decisions on BOTH sides for Z-test computation
     if n_t < MIN_PEER_DECISIONS or n_p < MIN_PEER_DECISIONS:
         return None
 
@@ -512,7 +474,7 @@ def compute_z_statistics(target_cp, peer_cp, target_match, peer_match):
     se_acpl = math.sqrt((var_acpl_t / n_t) + (var_acpl_p / n_p))
     z_acpl = (mean_acpl_p - mean_acpl_t) / se_acpl if se_acpl > 0 else 0.0
 
-    # 2. Top-1 Match Rate Z-Score (Two-proportion / Binomial model)
+    # 2. Top-1 Match Rate Z-Score
     p_t = sum(target_match) / n_t
     p_p = sum(peer_match) / n_p
     
@@ -538,7 +500,7 @@ def compute_z_statistics(target_cp, peer_cp, target_match, peer_match):
     }
 
 # -----------------------------------------------------------------------------
-# Interactive Prompts with Strict Error Checking
+# Interactive Prompts
 # -----------------------------------------------------------------------------
 def prompt_platform():
     """Prompts for target platform with strict option validation."""
@@ -548,7 +510,7 @@ def prompt_platform():
             return "chesscom"
         elif platform in ["2", "lichess"]:
             return "lichess"
-        print("[X] Invalid platform choice. Please enter '1' for Chess.com or '2' for Lichess.")
+        print("[X] Invalid choice. Enter '1' for Chess.com or '2' for Lichess.")
 
 def prompt_username(platform_key):
     """Prompts for username and validates immediately against platform API."""
@@ -567,35 +529,24 @@ def prompt_username(platform_key):
             print(f"[X] {err_msg} Please try again.")
 
 def prompt_time_control(platform_key):
-    """Prompts for time control with clean, platform-native menus."""
+    """Prompts for time control category FIRST before parsing archives."""
     if platform_key == "chesscom":
-        print("\nSelect Chess.com Time Control:")
+        print("\nSelect Time Control Category:")
         print(" 1. Blitz [Default]")
         print(" 2. Rapid")
         print(" 3. Bullet")
         print(" 4. Daily")
         
-        tc_map = {
-            "1": "blitz",
-            "2": "rapid",
-            "3": "bullet",
-            "4": "daily"
-        }
+        tc_map = {"1": "blitz", "2": "rapid", "3": "bullet", "4": "daily"}
     else:  # Lichess
-        print("\nSelect Lichess Time Control:")
+        print("\nSelect Time Control Category:")
         print(" 1. Blitz [Default]")
         print(" 2. Rapid")
         print(" 3. Bullet")
         print(" 4. Classical")
         print(" 5. Correspondence")
         
-        tc_map = {
-            "1": "blitz",
-            "2": "rapid",
-            "3": "bullet",
-            "4": "classical",
-            "5": "correspondence"
-        }
+        tc_map = {"1": "blitz", "2": "rapid", "3": "bullet", "4": "classical", "5": "correspondence"}
     
     while True:
         tc_input = input("Choice [Default: 1]: ").strip()
@@ -604,25 +555,21 @@ def prompt_time_control(platform_key):
         if tc_input in tc_map:
             return tc_map[tc_input]
             
-        print(f"[X] Invalid choice. Please enter a number between 1 and {len(tc_map)}.")
+        print(f"[X] Invalid choice. Enter a number between 1 and {len(tc_map)}.")
 
-def prompt_sample_size():
-    """Prompts for sample size strictly bounded between 25 and 100."""
-    print("\nSample Size Selection:")
-    print(" Allowed range: 25 to 100 games (e.g., 25 standard, 50 robust, 100 deep audit)")
+def prompt_audit_depth():
+    """Prompts for statistical target decision volume (200 vs 400)."""
+    print("\nSelect Evaluation Audit Target:")
+    print(" 1. Standard Audit  : Target 200 decisions [Default] (Minimum required for Welch's Z-test)")
+    print(" 2. Deep Audit      : Target 400 decisions (High-precision forensic review)")
     
     while True:
-        raw_count = input("Number of games to analyze [Default: 25]: ").strip()
-        if raw_count == "":
-            return 25
-        try:
-            val = int(raw_count)
-            if 25 <= val <= 100:
-                return val
-            else:
-                print("[X] Please enter a sample size between 25 and 100.")
-        except ValueError:
-            print("[X] Invalid input. Please enter a valid whole number.")
+        choice = input("Choice [Default: 1]: ").strip()
+        if choice in ["", "1"]:
+            return 200
+        elif choice == "2":
+            return 400
+        print("[X] Invalid choice. Please enter '1' for Standard Audit or '2' for Deep Audit.")
 
 # -----------------------------------------------------------------------------
 # Main Execution & Reporting
@@ -632,42 +579,36 @@ def main():
     print(" CHESS PERFORMANCE EVALUATOR (chess-perf-eval.py)")
     print("==================================================\n")
 
-    # Resolve Engine Path
+    # 1. Resolve Engine & Read Official Name
     stockfish_bin = find_stockfish()
-
-    # Validated Interactive Inputs
-    platform_key = prompt_platform()
-    username = prompt_username(platform_key)
-    speed_class = prompt_time_control(platform_key)
-    num_games = prompt_sample_size()
-
-    # Fetch Games
-    if platform_key == "chesscom":
-        games = fetch_chesscom_games(username, speed_class, num_games=num_games)
-    else:
-        games = fetch_lichess_games(username, speed_class, num_games=num_games)
-
-    if not games:
-        print(f"\n[!] No matching {speed_class.upper()} games retrieved for '{username}'. Exiting.")
-        return
-
-    # Initialize Engine
     try:
         engine = chess.engine.SimpleEngine.popen_uci(stockfish_bin)
+        engine_name = engine.id.get("name", "Stockfish Engine")
     except Exception as e:
         print(f"\nError initializing Stockfish binary at '{stockfish_bin}': {e}")
         if os.path.exists(CONFIG_FILE):
             print(f"Tip: Delete local '{CONFIG_FILE}' to reset the saved path.")
         return
 
-    print(f"\nEvaluating target games & harvesting opponent performance (Depth={ANALYSIS_DEPTH}, Max Time={ANALYSIS_TIME_LIMIT}s/move)...")
-    print(f"Filters Active: Ignoring positions > |{EVAL_CAP_CENTIPAWNS/100:.1f}| CP | Bounding single-move loss at {MAX_SINGLE_MOVE_LOSS} CP.\n")
+    # 2. Interactive Prompts
+    platform_key = prompt_platform()
+    username = prompt_username(platform_key)
+    speed_class = prompt_time_control(platform_key)
+    target_decisions = prompt_audit_depth()
+
+    # 3. Detect Specific Time Control within Selected Category ONLY
+    exact_time_control = find_most_frequent_time_control(platform_key, username, speed_class)
+
+    tc_label = f"{speed_class.upper()} ({exact_time_control})" if exact_time_control else speed_class.upper()
+    print(f"\nEngine Model   : {engine_name}")
+    print(f"Target Volume  : {target_decisions} Non-Forced Decisions ({tc_label})")
+    print(f"Filters Active : Opening cut <= 6 moves | Eval cap <= |400| CP | Max loss bound = 200 CP\n")
 
     t_decisions, t_matches, t_cp_loss = 0, 0, 0
     o_decisions, o_matches, o_cp_loss = 0, 0, 0
     t_ratings, o_ratings = [], []
+    games_analyzed = 0
     
-    # Decision arrays for variance & Z-score calculation
     target_cp_all, peer_cp_all = [], []
     target_match_all, peer_match_all = [], []
     
@@ -675,9 +616,16 @@ def main():
     target_clean = username.strip().lower()
     harvested_opponents.add(target_clean)
 
-    for idx, game in enumerate(games, start=1):
+    # 4. Stream and Harvest Games Until Decision Bucket Hits Target Volume
+    game_stream = stream_games(platform_key, username, speed_class, exact_tc=exact_time_control)
+    
+    for game in game_stream:
+        if t_decisions >= target_decisions:
+            break
+
         target_res, opp_res = analyze_game_and_harvest(game, username, engine)
-        if target_res:
+        if target_res and target_res["decisions"] > 0:
+            games_analyzed += 1
             t_ratings.append(target_res["rating"])
             t_decisions += target_res["decisions"]
             t_matches += target_res["matches"]
@@ -689,28 +637,22 @@ def main():
             g_acpl = target_res["cp_loss"] / target_res["decisions"]
             
             opp_str = f"vs {opp_res['name']} ({opp_res['rating']})" if opp_res else "vs Opponent"
-            print(f"[{idx:02d}/{len(games)}] {opp_str} | Decisions: {target_res['decisions']:2d} | Top-1: {g_match:5.1f}% | ACPL: {g_acpl:5.1f}")
+            print(f"[{games_analyzed:02d}] {opp_str} | +{target_res['decisions']:2d} Dec (Progress: {t_decisions}/{target_decisions}) | Top-1: {g_match:5.1f}% | ACPL: {g_acpl:5.1f}")
             
-            # HARVEST OPPONENT DATA WITH EXPLICIT CHECKS & CLEAR REJECTION LOGGING
             if opp_res:
                 opp_name = opp_res["name"]
                 opp_clean = opp_name.strip().lower()
                 opp_rating = opp_res["rating"]
                 target_rating = target_res["rating"]
 
-                # 1. Deduplication Check
                 if opp_clean in harvested_opponents:
-                    print(f"       └──> [PEER SKIPPED] Opponent '{opp_name}' is a duplicate (already in baseline).")
-
-                # 2. Rating Window Check (+/- 150 ELO)
+                    print(f"     └──> [PEER SKIPPED] Opponent '{opp_name}' is a duplicate.")
                 elif abs(opp_rating - target_rating) > RATING_WINDOW:
-                    print(f"       └──> [PEER SKIPPED] Opponent '{opp_name}' ({opp_rating}) outside rating window (+/- {RATING_WINDOW}).")
-
-                # 3. Account Status Check (Fair Play / TOS bans)
+                    print(f"     └──> [PEER SKIPPED] Opponent '{opp_name}' ({opp_rating}) outside rating window (+/- {RATING_WINDOW}).")
                 else:
                     active, status_reason = is_account_active(platform_key, opp_name)
                     if not active:
-                        print(f"       └──> [PEER EXCLUDED] Opponent '{opp_name}' - {status_reason}")
+                        print(f"     └──> [PEER EXCLUDED] Opponent '{opp_name}' - {status_reason}")
                     else:
                         harvested_opponents.add(opp_clean)
                         o_ratings.append(opp_rating)
@@ -719,41 +661,12 @@ def main():
                         o_cp_loss += opp_res["cp_loss"]
                         peer_cp_all.extend(opp_res["cp_list"])
                         peer_match_all.extend(opp_res["match_list"])
-                        print(f"       └──> [PEER HARVESTED] Opponent '{opp_name}' ({opp_rating}) added to peer baseline!")
-
-    # SECONDARY FALLBACK TRIGGER: If direct peer decisions < MIN_PEER_DECISIONS (200 moves)
-    if o_decisions < MIN_PEER_DECISIONS and len(t_ratings) > 0:
-        avg_target_elo = int(sum(t_ratings) / len(t_ratings))
-        
-        # Lock target user into exclusion set before pulling global pool
-        harvested_opponents.add(target_clean)
-        
-        fallback_games, fallback_users = fetch_global_peer_games(
-            platform_key, avg_target_elo, speed_class, harvested_opponents, required_games=25
-        )
-        
-        for p_user, f_game in fallback_games:
-            p_clean = p_user.strip().lower()
-            
-            # PREVENT DUPLICATES & SELF-HARVESTING
-            if p_clean in harvested_opponents:
-                continue
-                
-            p_target_res, p_opp_res = analyze_game_and_harvest(f_game, p_user, engine)
-            if p_target_res:
-                harvested_opponents.add(p_clean)  # Lock candidate immediately to prevent duplicate game logs
-                o_ratings.append(p_target_res["rating"])
-                o_decisions += p_target_res["decisions"]
-                o_matches += p_target_res["matches"]
-                o_cp_loss += p_target_res["cp_loss"]
-                peer_cp_all.extend(p_target_res["cp_list"])
-                peer_match_all.extend(p_target_res["match_list"])
-                print(f"       └──> [GLOBAL PEER HARVESTED] Active rating-matched peer '{p_user}' ({p_target_res['rating']}) injected into baseline!")
+                        print(f"     └──> [PEER HARVESTED] Opponent '{opp_name}' ({opp_rating}) added to baseline!")
 
     engine.quit()
 
     if t_decisions == 0:
-        print("\nNo critical non-forced moves found to analyze.")
+        print("\n[!] No valid critical decisions gathered from recent archives. Exiting.")
         return
 
     # Metrics Summary
@@ -766,33 +679,32 @@ def main():
     
     min_peer_r = min(o_ratings) if o_ratings else avg_target_rating - RATING_WINDOW
     max_peer_r = max(o_ratings) if o_ratings else avg_target_rating + RATING_WINDOW
-
-    # Adjust peer dataset count display to exclude target player
     display_peer_count = len(harvested_opponents - {target_clean})
 
     print("\n" + "=" * 60)
     print(f" EMPIRICAL EVALUATION REPORT: {username}")
     print("=" * 60)
-    print(f" Platform / Time Control : {platform_key.capitalize()} ({speed_class.upper()})")
-    print(f" Target Player Games     : {len(t_ratings)} games / {t_decisions} decisions")
-    print(f" Peer Dataset Size       : {display_peer_count} active opponents / {o_decisions} decisions")
-    print(f" Peer Rating Window      : [{min_peer_r} to {max_peer_r}]")
+    print(f" Platform / Category    : {platform_key.capitalize()} ({speed_class.upper()})")
+    print(f" Specific Time Control  : {exact_time_control if exact_time_control else 'All in Category'}")
+    print(f" Engine Model Used      : {engine_name}")
+    print(f" Target Decisions       : {t_decisions} moves across {games_analyzed} valid games")
+    print(f" Peer Baseline Volume   : {o_decisions} moves across {display_peer_count} active opponents")
+    print(f" Peer Rating Window     : [{min_peer_r} to {max_peer_r}]")
     print("-" * 60)
-    print(" PERFORMANCE METRICS      |  TARGET PLAYER  | REAL PEER BASELINE")
+    print(" PERFORMANCE METRICS     |  TARGET PLAYER  | REAL PEER BASELINE")
     print("-" * 60)
-    print(f" Top-1 Engine Fidelity   |      {actual_match_rate:5.1f}%       |       {peer_match_rate:5.1f}%")
-    print(f" Weighted Avg Loss (ACPL)|      {actual_acpl:5.1f}        |       {peer_acpl:5.1f}")
+    print(f" Top-1 Engine Fidelity  |      {actual_match_rate:5.1f}%       |       {peer_match_rate:5.1f}%")
+    print(f" Weighted Avg Loss(ACPL)|      {actual_acpl:5.1f}        |       {peer_acpl:5.1f}")
     print("-" * 60)
     
-    # Delta Summary
     match_delta = actual_match_rate - peer_match_rate
-    acpl_delta = peer_acpl - actual_acpl  # Positive means lower ACPL than expected (better precision)
+    acpl_delta = peer_acpl - actual_acpl
     
     print("\nEMPIRICAL DIAGNOSTIC:")
     print(f" • Match Rate Delta : {match_delta:+.1f}% vs direct peer sample")
     print(f" • Precision Delta  : {acpl_delta:+.1f} ACPL vs direct peer sample")
 
-    # Z-Score Computation Guardrail
+    # Z-Score Computation
     z_stats = compute_z_statistics(target_cp_all, peer_cp_all, target_match_all, peer_match_all)
     
     print("-" * 60)
@@ -820,13 +732,6 @@ def main():
         print(f" [!] INSUFFICIENT DECISION VOLUME FOR Z-TEST")
         print(f"     • Target Player Decisions : {t_decisions} moves (Required: {MIN_PEER_DECISIONS}+)")
         print(f"     • Peer Baseline Decisions : {o_decisions} moves (Required: {MIN_PEER_DECISIONS}+)")
-        
-        if num_games < 100:
-            print(f"\n [DIAGNOSTIC]: The requested sample of {num_games} games yielded under {MIN_PEER_DECISIONS} non-forced decisions.")
-            print(f"              Consider selecting a larger sample size (e.g., 50 or 100 games).")
-        else:
-            print(f"\n [DIAGNOSTIC]: The maximum sample size of {num_games} games yielded under {MIN_PEER_DECISIONS} non-forced decisions.")
-            print(f"              Insufficient move volume available in this game set to perform a valid Z-test.")
     print("=" * 60)
 
 if __name__ == "__main__":
