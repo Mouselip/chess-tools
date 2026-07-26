@@ -4,6 +4,20 @@ chess-perf-eval.py
 A terminal-native performance comparator tool that analyzes player games against 
 local Stockfish engine baselines using direct opponent harvesting, filtered ACPL stats,
 global baseline fallback generation, and empirical Z-score statistical diagnostics.
+
+Usage Options (CLI Parameters):
+  -p, --player <playername>                     Target player username on the platform.
+  -s, --site <chess.com | lichess.org>          Platform site.
+  -t, --time-control <bullet|blitz|rapid|classical>
+                                                Time control speed category.
+                                                Note: 'classical' is valid ONLY for Lichess.org.
+  --standard                                    Standard audit level (Target: 200 non-forced decisions).
+  --deep                                        Deep audit level (Target: 400 non-forced decisions).
+  -h, --help                                    Show the help screen and exit.
+
+Interactive Prompting:
+  Any parameter omitted from the command line will be interactively prompted at runtime.
+  Invalid command-line options will display an error and re-prompt for correct input.
 """
 
 import io
@@ -13,6 +27,7 @@ import json
 import math
 import shutil
 import random
+import argparse
 from collections import Counter
 import requests
 from requests.adapters import HTTPAdapter
@@ -40,7 +55,7 @@ MIN_PEER_DECISIONS = 200      # Strictly required decision count for valid Welch
 
 # Network Configuration
 MAX_RETRIES = 5
-USER_AGENT = "ChessPerfEval/1.0 (Contact: local_script_user)"
+USER_AGENT = "ChessPerfEval (Contact: local_script_user)"
 
 # -----------------------------------------------------------------------------
 # Robust HTTP Session Management
@@ -500,15 +515,42 @@ def compute_z_statistics(target_cp, peer_cp, target_match, peer_match):
     }
 
 # -----------------------------------------------------------------------------
-# Interactive Prompts
+# Interactive Prompts & Input Validation Helpers
 # -----------------------------------------------------------------------------
+def parse_and_validate_site(raw_site):
+    """Normalizes and validates site input. Returns 'chesscom', 'lichess', or None."""
+    if not raw_site:
+        return None
+    val = raw_site.strip().lower()
+    if val in ["1", "chess.com", "chesscom"]:
+        return "chesscom"
+    elif val in ["2", "lichess.org", "lichess"]:
+        return "lichess"
+    return None
+
+def validate_tc_for_site(platform_key, tc_str):
+    """Validates if time control string is valid for given platform."""
+    if not tc_str:
+        return None
+    val = tc_str.strip().lower()
+    valid_common = ["bullet", "blitz", "rapid"]
+    
+    if val in valid_common:
+        return val
+    elif val == "classical":
+        if platform_key == "lichess":
+            return "classical"
+        else:
+            return False  # Classical is invalid for Chess.com
+    return None
+
 def prompt_platform():
     """Prompts for target platform with strict option validation."""
     while True:
         platform = input("Platform (1: Chess.com, 2: Lichess) [Default: 1]: ").strip().lower()
         if platform in ["", "1", "chess.com", "chesscom"]:
             return "chesscom"
-        elif platform in ["2", "lichess"]:
+        elif platform in ["2", "lichess", "lichess.org"]:
             return "lichess"
         print("[X] Invalid choice. Enter '1' for Chess.com or '2' for Lichess.")
 
@@ -575,6 +617,25 @@ def prompt_audit_depth():
 # Main Execution & Reporting
 # -----------------------------------------------------------------------------
 def main():
+    parser = argparse.ArgumentParser(
+        description="Chess Performance Evaluator CLI - Evaluates player precision and ACPL against local Stockfish engine baselines.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  python chess-perf-eval.py -p Hikaru -s chess.com -t blitz --deep
+  python chess-perf-eval.py -p MagnusCarlsen -s lichess.org -t classical --standard
+  python chess-perf-eval.py  (runs in interactive mode)
+"""
+    )
+    parser.add_argument("-p", "--player", metavar="<playername>", help="Target player username on the platform", type=str, default=None)
+    parser.add_argument("-s", "--site", metavar="<site>", help="Platform site ('chess.com' or 'lichess.org')", type=str, default=None)
+    parser.add_argument("-t", "--time-control", metavar="<bullet, blitz, rapid, classical>", help="Time control speed category", type=str, default=None)
+    
+    depth_group = parser.add_mutually_exclusive_group()
+    depth_group.add_argument("--standard", action="store_true", help="Standard audit level (Target: 200 non-forced decisions)")
+    depth_group.add_argument("--deep", action="store_true", help="Deep audit level (Target: 400 non-forced decisions)")
+
+    args = parser.parse_args()
+
     print("==================================================")
     print(" CHESS PERFORMANCE EVALUATOR (chess-perf-eval.py)")
     print("==================================================\n")
@@ -590,11 +651,51 @@ def main():
             print(f"Tip: Delete local '{CONFIG_FILE}' to reset the saved path.")
         return
 
-    # 2. Interactive Prompts
-    platform_key = prompt_platform()
-    username = prompt_username(platform_key)
-    speed_class = prompt_time_control(platform_key)
-    target_decisions = prompt_audit_depth()
+    # 2. Process Command Line Parameters & Prompt ONLY for Missing / Invalid Parameters
+    platform_key = None
+    if args.site:
+        platform_key = parse_and_validate_site(args.site)
+        if not platform_key:
+            print(f"[X] Error: Invalid site parameter '{args.site}'.")
+            platform_key = prompt_platform()
+    else:
+        platform_key = prompt_platform()
+
+    username = None
+    if args.player:
+        raw_user = args.player.strip()
+        print(f"Verifying CLI username '{raw_user}' on {platform_key.capitalize()}...")
+        valid, err_msg = validate_username(platform_key, raw_user)
+        if valid:
+            print(f"[+] Username '{raw_user}' verified successfully.")
+            username = raw_user
+        else:
+            print(f"[X] {err_msg}")
+            username = prompt_username(platform_key)
+    else:
+        username = prompt_username(platform_key)
+
+    speed_class = None
+    if args.time_control:
+        tc_res = validate_tc_for_site(platform_key, args.time_control)
+        if tc_res is False:
+            print(f"[X] Error: 'classical' speed category is only available on Lichess.org, not {platform_key.capitalize()}.")
+            speed_class = prompt_time_control(platform_key)
+        elif tc_res is None:
+            print(f"[X] Error: Invalid time control category '{args.time_control}'. Expected: bullet, blitz, rapid, or classical.")
+            speed_class = prompt_time_control(platform_key)
+        else:
+            speed_class = tc_res
+    else:
+        speed_class = prompt_time_control(platform_key)
+
+    target_decisions = None
+    if args.standard:
+        target_decisions = 200
+    elif args.deep:
+        target_decisions = 400
+    else:
+        target_decisions = prompt_audit_depth()
 
     # 3. Detect Specific Time Control within Selected Category ONLY
     exact_time_control = find_most_frequent_time_control(platform_key, username, speed_class)
@@ -684,9 +785,12 @@ def main():
     print("\n" + "=" * 60)
     print(f" EMPIRICAL EVALUATION REPORT: {username}")
     print("=" * 60)
+    print(f" Engine Model   : {engine_name}")
+    print(f" Target Volume  : {target_decisions} Non-Forced Decisions ({tc_label})")
+    print(f" Filters Active : Opening cut <= 6 moves | Eval cap <= |400| CP | Max loss bound = 200 CP")
+    print("-" * 60)
     print(f" Platform / Category    : {platform_key.capitalize()} ({speed_class.upper()})")
     print(f" Specific Time Control  : {exact_time_control if exact_time_control else 'All in Category'}")
-    print(f" Engine Model Used      : {engine_name}")
     print(f" Target Decisions       : {t_decisions} moves across {games_analyzed} valid games")
     print(f" Peer Baseline Volume   : {o_decisions} moves across {display_peer_count} active opponents")
     print(f" Peer Rating Window     : [{min_peer_r} to {max_peer_r}]")
