@@ -467,10 +467,9 @@ def calculate_sample_variance(data_list):
     return sum((x - mean) ** 2 for x in data_list) / (n - 1)
 
 def z_to_p_value(z_score):
-    """Converts a positive Z-score to a one-tailed p-value."""
-    if z_score <= 0:
-        return 0.5
-    return 0.5 * math.erfc(z_score / math.sqrt(2))
+    """Calculates upper-tail p-value for positive Z-scores."""
+    cdf = 0.5 * (1.0 + math.erf(z_score / math.sqrt(2)))
+    return 1.0 - cdf
 
 def compute_z_statistics(target_cp, peer_cp, target_match, peer_match):
     """Computes two-sample Welch's Z-scores and standard errors."""
@@ -821,11 +820,13 @@ def main():
         print(f" • Top-1 Match Z-Score    : {z_stats['z_match']:+.2f}  (SE: {z_stats['se_match']*100:.2f}%)")
         print(f" • ACPL Precision Z-Score : {z_stats['z_acpl']:+.2f}  (SE: {z_stats['se_acpl']:.2f} CP)")
         print(f" • Combined Z-Score       : {z_comp:+.2f}")
-        print(f" • P-Value (One-Tailed)   : {p_val:.4f}")
+        print(f" • P-Value (Upper-Tail)   : {p_val:.4f}")
         
         print("\nSTATISTICAL EVALUATION:")
-        if z_comp < 2.0:
-            print(" [✓] NORMAL VARIANCE (Z < +2.0): Play style sits completely within expectable human variation.")
+        if z_comp < -2.0:
+            print(" [▼] SIGNIFICANT UNDERPERFORMANCE (Z < -2.0): Player performed noticeably below peer baseline.")
+        elif -2.0 <= z_comp < 2.0:
+            print(" [✓] NORMAL VARIANCE (-2.0 <= Z < +2.0): Play style sits completely within expectable human variation.")
         elif 2.0 <= z_comp < 3.0:
             print(" [!] OUTLIER PERFORMANCE (+2.0 <= Z < +3.0): Player significantly outperformed peers (95%+ confidence).")
         elif 3.0 <= z_comp < 5.0:
