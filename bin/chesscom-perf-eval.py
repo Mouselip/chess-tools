@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-chess-perf-eval.py
+chesscom-perf-eval.py
 A terminal-native performance comparator tool that analyzes Chess.com player games 
 against local Stockfish engine baselines using direct opponent harvesting, filtered ACPL stats,
 non-parametric Mann-Whitney U diagnostics, and two-sample proportion tests.
@@ -742,10 +742,10 @@ def main():
         description="Chess.com Performance Evaluator - Evaluates middlegame precision, ACPL, and candidate move correlation against local Stockfish engine baselines.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  python bin/chess-perf-eval.py -p Hikaru -t blitz
-  python bin/chess-perf-eval.py -p carlos071999 -t blitz -960 --tournaments 5
-  python bin/chess-perf-eval.py -p Elwass2 -t rapid -o
-  python bin/chess-perf-eval.py  (runs in interactive mode)
+  python bin/chesscom-perf-eval.py -p Hikaru -t blitz
+  python bin/chesscom-perf-eval.py -p carlos071999 -t blitz -960 --tournaments 5
+  python bin/chesscom-perf-eval.py -p Elwass2 -t rapid -o
+  python bin/chesscom-perf-eval.py  (runs in interactive mode)
 """
     )
     parser.add_argument("-p", "--player", metavar="<playername>", help="Target player username on Chess.com", type=str, default=None)
