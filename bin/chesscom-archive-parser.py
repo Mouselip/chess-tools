@@ -1,0 +1,360 @@
+#!/home/tyrin/.local/share/python-global-venv/bin/python
+
+# chesscom-archive-parser.py
+# Copyright (C) 2025 Tyrin Price
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+"""
+Usage:
+  chesscom-archive-parser.py <chess.com_username>
+  chesscom-archive-parser.py -h | --help
+
+Description:
+  Downloads all PGN game archives for a specified Chess.com username, extracts
+  unique opponent usernames, fetches their account details via the Chess.com public API,
+  and generates categorized CSV/TXT reports.
+
+Output Locations:
+  - Game PGNs are saved in an 'archives' subdirectory within the current working directory (./archives/).
+  - Generated reports, logs, and CSV/TXT files are output directly into the current working directory.
+"""
+
+import sys
+import os
+import datetime
+import csv
+import time
+import requests
+import chess.pgn
+
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+
+def print_usage_and_exit(code=0):
+    print(__doc__.strip())
+    sys.exit(code)
+
+
+def validate_user_exists(username):
+    """
+    Verify if a Chess.com username exists before proceeding.
+    Returns True if valid, False if 404 or missing profile.
+    """
+    api_url = f"https://api.chess.com/pub/player/{username}"
+    try:
+        resp = requests.get(api_url, headers=HEADERS)
+        if resp.status_code == 404:
+            return False
+        resp.raise_for_status()
+        return True
+    except requests.RequestException:
+        return False
+
+
+def get_archive_urls(username):
+    url = f"https://api.chess.com/pub/player/{username}/games/archives"
+    try:
+        resp = requests.get(url, headers=HEADERS)
+        resp.raise_for_status()
+        return resp.json().get("archives", [])
+    except requests.RequestException as e:
+        print(f"❌ HTTP error: {e}")
+        return []
+
+
+def download_pgn(username, archive_url, download_dir):
+    date_segment = archive_url.split("/")[-2:]
+    date_str = "-".join(date_segment)
+    filename = f"{username}_{date_str}.pgn"
+    filepath = os.path.join(download_dir, filename)
+
+    if os.path.exists(filepath):
+        print(f"✅ Already downloaded: {filename}")
+        return filepath
+
+    pgn_url = f"{archive_url}/pgn"
+    try:
+        resp = requests.get(pgn_url, headers=HEADERS)
+        resp.raise_for_status()
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(resp.text)
+        print(f"⬇️  Downloaded: {filename}")
+        return filepath
+    except requests.RequestException as e:
+        print(f"❌ Failed to download {pgn_url}: {e}")
+        return None
+
+
+def extract_opponents_from_pgn_files(username, archive_dir):
+    opponents = set()
+    for filename in os.listdir(archive_dir):
+        if not filename.endswith(".pgn"):
+            continue
+        filepath = os.path.join(archive_dir, filename)
+        with open(filepath, "r", encoding="utf-8") as f:
+            while True:
+                game = chess.pgn.read_game(f)
+                if game is None:
+                    break
+                white = game.headers.get("White", "").lower()
+                black = game.headers.get("Black", "").lower()
+                if white == username.lower():
+                    opponents.add(black)
+                elif black == username.lower():
+                    opponents.add(white)
+    return sorted(opponents)
+
+
+def fetch_account_info(username):
+    """
+    Fetch account info for a single Chess.com username.
+
+    Returns (info_dict, error_message, status_code)
+
+    info_dict is None on error.
+    error_message is None on success.
+    status_code is an int when available, otherwise None.
+    """
+    api_url = f"https://api.chess.com/pub/player/{username}"
+    try:
+        resp = requests.get(api_url, headers=HEADERS)
+        status_code = resp.status_code
+        if status_code == 404:
+            return None, "Not found", status_code
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "Player_id": data.get("player_id"),
+            "API_URL": api_url,
+            "User_URL": f"https://www.chess.com/member/{data.get('username', username)}",
+            "Username": data.get("username", ""),
+            "Title": data.get("title", ""),
+            "Followers": data.get("followers", 0),
+            "Country": data.get("country", "").split("/")[-1],
+            "Last_online": data.get("last_online", 0),
+            "Joined": data.get("joined", 0),
+            "Status": data.get("status", ""),
+            "League": data.get("league", ""),
+        }, None, status_code
+    except requests.RequestException as e:
+        status_code = None
+        if hasattr(e, "response") and e.response is not None:
+            try:
+                status_code = e.response.status_code
+            except Exception:
+                status_code = None
+        return None, str(e), status_code
+
+
+def is_transient_error(status_code):
+    """
+    Classify errors for retry decisions.
+
+    Transient:
+      - status_code is None (network type failure)
+      - status_code == 429
+      - 500 <= status_code < 600
+
+    Permanent:
+      - everything else
+    """
+    if status_code is None:
+        return True
+    if status_code == 429:
+        return True
+    if 500 <= status_code < 600:
+        return True
+    return False
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
+        print_usage_and_exit(
+            code=0 if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help") else 1
+        )
+
+    username = sys.argv[1].strip().lower()
+
+    # Early validation check before touch/creation of any local files/dirs
+    print(f"🔍 Validating Chess.com user '{username}'...")
+    if not validate_user_exists(username):
+        print(f"❌ Error: Chess.com username '{username}' does not exist.")
+        sys.exit(1)
+
+    cwd = os.getcwd()
+    archive_dir = os.path.join(cwd, "archives")
+
+    print(f"ℹ️  Report output location: {cwd}")
+    print(f"ℹ️  PGN archives directory:  {archive_dir}")
+
+    timestamp = datetime.datetime.now().strftime("%y%m%d%H%M")
+    opponents_file = f"{timestamp}-opponents.txt"
+    data_file = f"{timestamp}-opp-data.csv"
+    error_log = f"{timestamp}-error.log"
+    request_log = f"{timestamp}-requests.log"
+    fpv_file = f"{timestamp}-fpv.csv"
+    abuse_file = f"{timestamp}-abuse.csv"
+    self_file = f"{timestamp}-self.csv"
+
+    os.makedirs(archive_dir, exist_ok=True)
+
+    print(f"\n📁 Downloading Chess.com archives for '{username}' to: {archive_dir}")
+    archive_urls = get_archive_urls(username)
+    for url in archive_urls:
+        download_pgn(username, url, archive_dir)
+
+    print("\n👥 Extracting opponent usernames...")
+    opponents = extract_opponents_from_pgn_files(username, archive_dir)
+    with open(opponents_file, "w") as f:
+        for opp in opponents:
+            f.write(f"{opp}\n")
+    print(f"✅ Saved opponents to {opponents_file}")
+
+    print("\n🌐 Fetching account info from Chess.com API...")
+    with open(data_file, "w", newline="") as csvfile, \
+         open(fpv_file, "w", newline="") as fpv_csv, \
+         open(abuse_file, "w", newline="") as abuse_csv, \
+         open(self_file, "w", newline="") as self_csv, \
+         open(error_log, "w") as errfile, \
+         open(request_log, "w") as reqfile:
+
+        fieldnames = [
+            "Player_id",
+            "API_URL",
+            "User_URL",
+            "Username",
+            "Title",
+            "Followers",
+            "Country",
+            "Last_online",
+            "Joined",
+            "Status",
+            "League",
+        ]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer_fpv = csv.DictWriter(fpv_csv, fieldnames=fieldnames)
+        writer_abuse = csv.DictWriter(abuse_csv, fieldnames=fieldnames)
+        writer_self = csv.DictWriter(self_csv, fieldnames=fieldnames)
+
+        writer.writeheader()
+        writer_fpv.writeheader()
+        writer_abuse.writeheader()
+        writer_self.writeheader()
+
+        # request_log header
+        reqfile.write("timestamp|username|attempt|result|status_code|note\n")
+
+        total = len(opponents)
+        max_attempts = 3
+
+        for idx, opp in enumerate(opponents, start=1):
+            print(f"[{idx}/{total}] Fetching: {opp}")
+
+            attempt = 0
+            success = False
+            last_error = None
+            info = None
+            had_error = False
+
+            while attempt < max_attempts and not success:
+                attempt += 1
+                info, error, status_code = fetch_account_info(opp)
+                now_str = datetime.datetime.now().isoformat(timespec="seconds")
+
+                if info is not None:
+                    # success on this attempt
+                    success = True
+                    if had_error:
+                        # only log success if there were prior errors
+                        note = "resolved_after_retry"
+                        reqfile.write(
+                            f"{now_str}|{opp}|{attempt}|SUCCESS|{status_code}|{note}\n"
+                        )
+                    break
+
+                # failure on this attempt
+                last_error = error
+                transient = is_transient_error(status_code)
+                had_error = True
+
+                if transient:
+                    note = f"transient_error:{error}"
+                else:
+                    note = f"permanent_error:{error}"
+
+                reqfile.write(
+                    f"{now_str}|{opp}|{attempt}|ERROR|{status_code}|{note}\n"
+                )
+
+                if not transient:
+                    # do not retry permanent errors
+                    break
+
+                if attempt < max_attempts:
+                    # bounded backoff
+                    sleep_seconds = 10 * attempt
+                    print(
+                        f"   transient error for {opp} (status={status_code}), "
+                        f"retrying in {sleep_seconds} seconds..."
+                    )
+                    time.sleep(sleep_seconds)
+
+            if success and info is not None:
+                writer.writerow(info)
+                status = str(info.get("Status", "")).strip().lower()
+                if status == "closed:fair_play_violations":
+                    writer_fpv.writerow(info)
+                elif status == "closed:abuse":
+                    writer_abuse.writerow(info)
+                elif status == "closed":
+                    writer_self.writerow(info)
+                elif status.startswith("closed"):
+                    print(
+                        f"⚠️  Unmatched closed status for {opp}: '{status}'"
+                    )
+                    errfile.write(
+                        f"{opp}: unmatched closed status '{status}'\n"
+                    )
+            else:
+                # only log here if it never succeeded
+                if last_error is None:
+                    last_error = "Unknown error"
+                errfile.write(f"{opp}: {last_error}\n")
+                print(f"⚠️  Failed to fetch {opp}: {last_error}")
+
+    print(f"\n✅ Account data saved to {data_file}")
+    print(f"📄 Errors logged to {error_log}")
+    print(f"📄 Request attempts logged to {request_log}")
+    print(f"📄 FPV accounts saved to {fpv_file}")
+    print(f"📄 Abuse accounts saved to {abuse_file}")
+    print(f"📄 Closed (self) accounts saved to {self_file}")
+
+    def extract_usernames_from_csv(csv_path, txt_path):
+        with open(csv_path, newline="") as csvfile, open(txt_path, "w") as txtfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                txtfile.write(f"{row['Username'].lower()}\n")
+
+    extract_usernames_from_csv(fpv_file, f"{timestamp}-fpv.txt")
+    extract_usernames_from_csv(abuse_file, f"{timestamp}-abuse.txt")
+    extract_usernames_from_csv(self_file, f"{timestamp}-self.txt")
+
+    print(f"📄 FPV usernames saved to {timestamp}-fpv.txt")
+    print(f"📄 Abuse usernames saved to {timestamp}-abuse.txt")
+    print(f"📄 Self usernames saved to {timestamp}-self.txt")
+
+
+if __name__ == "__main__":
+    main()
