@@ -39,7 +39,7 @@ import chess.engine
 import chess.pgn
 
 # Version Metadata
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 # System Configuration
 CONFIG_FILE = os.path.join(os.getcwd(), "engine_config.json")
@@ -802,7 +802,7 @@ def main():
     clean_user = username.strip().lower()
     if args.log:
         timestamp_prefix = datetime.now().strftime("%y%m%d%H%M%S")
-        log_file_path = os.path.join(os.getcwd(), f"{timestamp_prefix}-{clean_user}.log")
+        log_file_path = os.path.join(os.getcwd(), f"{clean_user}-{timestamp_prefix}.log")
         try:
             log_file = open(log_file_path, "w", encoding="utf-8")
         except OSError as e:
