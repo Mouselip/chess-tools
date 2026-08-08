@@ -20,6 +20,7 @@
 Usage:
   chesscom-archive-parser.py <chess.com_username>
   chesscom-archive-parser.py -h | --help
+  chesscom-archive-parser.py -v | --version
 
 Description:
   Downloads all PGN game archives for a specified Chess.com username, extracts
@@ -29,6 +30,9 @@ Description:
 Output Locations:
   - Game PGNs are saved in an 'archives' subdirectory within the current working directory (./archives/).
   - Generated reports, logs, and CSV/TXT files are output directly into the current working directory.
+
+Notes:
+  - Archive downloads are cached: if a monthly PGN file already exists in ./archives/, downloading is skipped.
 """
 
 import sys
@@ -39,6 +43,7 @@ import time
 import requests
 import chess.pgn
 
+__version__ = "0.0.1"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
@@ -180,6 +185,10 @@ def is_transient_error(status_code):
 
 
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] in ("-v", "--version"):
+        print(f"chesscom-archive-parser v{__version__}")
+        sys.exit(0)
+
     if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
         print_usage_and_exit(
             code=0 if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help") else 1
