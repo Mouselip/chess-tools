@@ -5,17 +5,20 @@ A terminal-native performance comparator tool that analyzes Chess.com player gam
 against local Stockfish engine baselines using direct opponent harvesting, filtered ACPL stats,
 non-parametric Mann-Whitney U diagnostics, and two-sample proportion tests.
 
-Usage Options (CLI Parameters):
-  -p, --player <playername>                     Target player username on Chess.com.
-  -t, --time-control <bullet|blitz|rapid|daily> Speed category.
+Usage Options:
+  chesscom-perf-eval.py <playername> <bullet|blitz|rapid|daily> [options]
+
+Positional Parameters:
+  playername                                    Target player username on Chess.com.
+  {bullet,blitz,rapid,daily}                    Speed category.
+
+Options:
   -o, --override-window                         Expand peer rating window from +/-150 to +/-250 Elo.
   -960, --chess960                              Enable Chess960 (Fischer Random) mode.
   --tournaments [N]                             Audit up to N recent tournaments in category (Default: 5).
   --log                                         Enable logging to a timestamped file in cwd.
+  -v, --version                                 Show program's version number and exit.
   -h, --help                                    Show the help screen and exit.
-
-Interactive Prompting:
-  Any parameter omitted from the command line will be interactively prompted at runtime.
 """
 
 import io
@@ -34,6 +37,9 @@ import scipy.stats as stats
 import chess
 import chess.engine
 import chess.pgn
+
+# Version Metadata
+__version__ = "0.0.1"
 
 # System Configuration
 CONFIG_FILE = os.path.join(os.getcwd(), "engine_config.json")
@@ -59,7 +65,16 @@ OVERRIDE_RATING_WINDOW = 250  # Expanded search window (+/- 250 Elo)
 
 # Network Configuration
 MAX_RETRIES = 5
-USER_AGENT = "ChessPerfEval (Contact: local_script_user)"
+USER_AGENT = f"ChessPerfEval/{__version__} (Contact: local_script_user)"
+
+
+def stream_write(text, log_file=None, end="\n"):
+    """Outputs text simultaneously to stdout and to an open log file if present."""
+    print(text, end=end)
+    if log_file:
+        log_file.write(text + end)
+        log_file.flush()
+
 
 # -----------------------------------------------------------------------------
 # Robust HTTP Session Management
@@ -70,7 +85,7 @@ def get_robust_session():
         total=MAX_RETRIES,
         backoff_factor=1.5,
         status_forcelist=[429, 500, 502, 503, 504],
-        raise_on_status=False
+        raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("http://", adapter)
@@ -78,7 +93,9 @@ def get_robust_session():
     session.headers.update({"User-Agent": USER_AGENT})
     return session
 
+
 HTTP_SESSION = get_robust_session()
+
 
 # -----------------------------------------------------------------------------
 # Terminal Engine Resolution
@@ -95,6 +112,7 @@ def load_saved_engine_path():
             pass
     return None
 
+
 def save_engine_path(path):
     try:
         config_data = {"stockfish_path": os.path.abspath(path)}
@@ -102,7 +120,7 @@ def save_engine_path(path):
             json.dump(config_data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-            
+
         if os.path.exists(CONFIG_FILE):
             print(f"[+] Saved configuration to: {CONFIG_FILE}\n")
         else:
@@ -110,36 +128,42 @@ def save_engine_path(path):
     except Exception as e:
         print(f"[!] Error: Could not write configuration file: {e}\n")
 
+
 def prompt_terminal_path_input():
     print("\n" + "=" * 60)
     print("[!] Stockfish executable was not found automatically.")
     print("=" * 60)
-    
+
     while True:
         user_input = input("Enter full path to Stockfish binary (or 'q' to quit): ").strip()
         user_input = user_input.strip("'\"")
-        
-        if user_input.lower() == 'q':
+
+        if user_input.lower() == "q":
             print("Exiting.")
             sys.exit(1)
-            
+
         expanded_path = os.path.expanduser(user_input)
         if os.path.isfile(expanded_path):
             print(f"\nAccepted binary path: '{expanded_path}'")
             while True:
-                save_choice = input("Save this path to 'engine_config.json' in current directory? (y/n): ").strip().lower()
-                if save_choice in ['y', 'yes']:
+                save_choice = (
+                    input("Save this path to 'engine_config.json' in current directory? (y/n): ")
+                    .strip()
+                    .lower()
+                )
+                if save_choice in ["y", "yes"]:
                     save_engine_path(expanded_path)
                     break
-                elif save_choice in ['n', 'no']:
+                elif save_choice in ["n", "no"]:
                     print("[+] Path accepted for this session only.\n")
                     break
                 else:
                     print("[X] Invalid entry. Please enter 'y' or 'n'.")
-                
+
             return expanded_path
         else:
             print(f"[X] Invalid file path: '{user_input}'. Please try again.\n")
+
 
 def find_stockfish():
     saved = load_saved_engine_path()
@@ -158,7 +182,7 @@ def find_stockfish():
         "/usr/bin",
         "/usr/local/bin",
         "/usr/games",
-        "/opt/homebrew/bin"
+        "/opt/homebrew/bin",
     ]
 
     for d in search_dirs:
@@ -173,6 +197,7 @@ def find_stockfish():
             return path_in_env
 
     return prompt_terminal_path_input()
+
 
 # -----------------------------------------------------------------------------
 # API Fetchers & Validation (Chess.com Only)
@@ -190,6 +215,7 @@ def validate_username(username):
     except requests.RequestException as e:
         return False, f"Network error validating user: {e}"
 
+
 def is_account_active(username):
     url = f"https://api.chess.com/pub/player/{username}"
     try:
@@ -203,6 +229,7 @@ def is_account_active(username):
     except requests.RequestException as e:
         return False, f"Network error checking status ({type(e).__name__})"
 
+
 # -----------------------------------------------------------------------------
 # Tournament & Time Control Fetchers
 # -----------------------------------------------------------------------------
@@ -210,7 +237,7 @@ def fetch_recent_tournaments(username, max_count=5):
     print(f"\nFetching tournament history for user '{username}'...")
     url = f"https://api.chess.com/pub/player/{username}/tournaments"
     matching_tournaments = []
-    
+
     try:
         res = HTTP_SESSION.get(url, timeout=10)
         if res.status_code == 200:
@@ -220,11 +247,9 @@ def fetch_recent_tournaments(username, max_count=5):
                 t_url = t.get("url", "")
                 t_id = t_url.split("/")[-1] if t_url else ""
                 if t_id:
-                    matching_tournaments.append({
-                        "id": t_id,
-                        "name": t.get("name", t_id),
-                        "url": t_url
-                    })
+                    matching_tournaments.append(
+                        {"id": t_id, "name": t.get("name", t_id), "url": t_url}
+                    )
                     if len(matching_tournaments) >= max_count:
                         break
     except requests.RequestException as e:
@@ -232,9 +257,12 @@ def fetch_recent_tournaments(username, max_count=5):
 
     return matching_tournaments
 
+
 def find_most_frequent_time_control(username, speed_class, is_c960=False):
     v_label = "CHESS960" if is_c960 else "STANDARD"
-    print(f"\nScanning recent archives for {v_label} category '{speed_class.upper()}' to detect primary time control...")
+    print(
+        f"\nScanning recent archives for {v_label} category '{speed_class.upper()}' to detect primary time control..."
+    )
     tc_counter = Counter()
 
     archives_url = f"https://api.chess.com/pub/player/{username}/games/archives"
@@ -250,7 +278,7 @@ def find_most_frequent_time_control(username, speed_class, is_c960=False):
                 for g in data:
                     if not g.get("rated", False):
                         continue
-                    
+
                     if g.get("tournament") or "tournament" in g.get("url", "").lower():
                         continue
 
@@ -271,37 +299,55 @@ def find_most_frequent_time_control(username, speed_class, is_c960=False):
 
     if tc_counter:
         top_tc, count = tc_counter.most_common(1)[0]
-        print(f"[+] Primary rated time control detected in '{speed_class.upper()}': '{top_tc}' ({count} recent games).")
+        print(
+            f"[+] Primary rated time control detected in '{speed_class.upper()}': '{top_tc}' ({count} recent games)."
+        )
         return top_tc
 
     return None
 
+
 def is_tournament_game(game_dict, pgn_game):
     if game_dict.get("tournament") or "tournament" in game_dict.get("url", "").lower():
         return True
-    
+
     if pgn_game and pgn_game.headers:
         event = pgn_game.headers.get("Event", "").lower()
         if "tournament" in event or "arena" in event or "swiss" in event:
             return True
-            
+
     return False
+
 
 # -----------------------------------------------------------------------------
 # Game Harvesting Streamer
 # -----------------------------------------------------------------------------
-def stream_games(username, speed_class, exact_tc=None, is_c960=False, tournaments=None, current_decisions_callback=None):
+def stream_games(
+    username,
+    speed_class,
+    exact_tc=None,
+    is_c960=False,
+    tournaments=None,
+    current_decisions_callback=None,
+):
     if tournaments:
-        print(f"\n[+] Tournament Mode Active: Streaming games across up to {len(tournaments)} matched events...")
+        print(
+            f"\n[+] Tournament Mode Active: Streaming games across up to {len(tournaments)} matched events..."
+        )
         for tour in tournaments:
-            if current_decisions_callback and current_decisions_callback() >= TARGET_MAX_DECISIONS:
-                print(f"[+] Decision target reached ({current_decisions_callback()}/{TARGET_MAX_DECISIONS}). Halting further tournament fetches.")
+            if (
+                current_decisions_callback
+                and current_decisions_callback() >= TARGET_MAX_DECISIONS
+            ):
+                print(
+                    f"[+] Decision target reached ({current_decisions_callback()}/{TARGET_MAX_DECISIONS}). Halting further tournament fetches."
+                )
                 break
 
             tour_id = tour["id"]
             tour_name = tour["name"]
             print(f"\n -> Harvesting Tournament: {tour_name} ({tour_id})")
-            
+
             tour_url = f"https://api.chess.com/pub/tournament/{tour_id}"
             try:
                 res = HTTP_SESSION.get(tour_url, timeout=10)
@@ -309,24 +355,24 @@ def stream_games(username, speed_class, exact_tc=None, is_c960=False, tournament
                     continue
                 tour_data = res.json()
                 rounds = tour_data.get("rounds", [])
-                
+
                 for r_url in rounds:
                     r_res = HTTP_SESSION.get(r_url, timeout=10)
                     if r_res.status_code != 200:
                         continue
-                    
+
                     groups = r_res.json().get("groups", [])
                     for g_url in groups:
                         g_res = HTTP_SESSION.get(g_url, timeout=10)
                         if g_res.status_code != 200:
                             continue
-                        
+
                         games_list = g_res.json().get("games", [])
                         for g in reversed(games_list):
                             w_player = g.get("white", {}).get("username", "").lower()
                             b_player = g.get("black", {}).get("username", "").lower()
                             user_clean = username.lower()
-                            
+
                             if user_clean in (w_player, b_player):
                                 pgn_text = g.get("pgn", "")
                                 if pgn_text:
@@ -346,7 +392,10 @@ def stream_games(username, speed_class, exact_tc=None, is_c960=False, tournament
                 return
             archives = res.json().get("archives", [])
             for archive_url in reversed(archives):
-                if current_decisions_callback and current_decisions_callback() >= TARGET_MAX_DECISIONS:
+                if (
+                    current_decisions_callback
+                    and current_decisions_callback() >= TARGET_MAX_DECISIONS
+                ):
                     break
 
                 game_res = HTTP_SESSION.get(archive_url, timeout=10)
@@ -354,7 +403,10 @@ def stream_games(username, speed_class, exact_tc=None, is_c960=False, tournament
                     continue
                 data = game_res.json().get("games", [])
                 for g in reversed(data):
-                    if current_decisions_callback and current_decisions_callback() >= TARGET_MAX_DECISIONS:
+                    if (
+                        current_decisions_callback
+                        and current_decisions_callback() >= TARGET_MAX_DECISIONS
+                    ):
                         break
 
                     if not g.get("rated", False):
@@ -371,10 +423,10 @@ def stream_games(username, speed_class, exact_tc=None, is_c960=False, tournament
                     if tc_class.lower() == speed_class.lower():
                         if exact_tc and tc_control != exact_tc:
                             continue
-                            
+
                         pgn_io = io.StringIO(g.get("pgn", ""))
                         game = chess.pgn.read_game(pgn_io)
-                        
+
                         if is_tournament_game(g, game):
                             continue
 
@@ -384,33 +436,39 @@ def stream_games(username, speed_class, exact_tc=None, is_c960=False, tournament
             print(f"Network error streaming games: {e}")
             return
 
+
 # -----------------------------------------------------------------------------
 # Game Analysis Engine
 # -----------------------------------------------------------------------------
 def is_endgame_phase(board):
     has_white_queen = bool(board.pieces(chess.QUEEN, chess.WHITE))
     has_black_queen = bool(board.pieces(chess.QUEEN, chess.BLACK))
-    
+
     non_pawn_pieces = (
-        len(board.pieces(chess.KNIGHT, chess.WHITE)) + len(board.pieces(chess.KNIGHT, chess.BLACK)) +
-        len(board.pieces(chess.BISHOP, chess.WHITE)) + len(board.pieces(chess.BISHOP, chess.BLACK)) +
-        len(board.pieces(chess.ROOK, chess.WHITE))   + len(board.pieces(chess.ROOK, chess.BLACK)) +
-        len(board.pieces(chess.QUEEN, chess.WHITE))  + len(board.pieces(chess.QUEEN, chess.BLACK))
+        len(board.pieces(chess.KNIGHT, chess.WHITE))
+        + len(board.pieces(chess.KNIGHT, chess.BLACK))
+        + len(board.pieces(chess.BISHOP, chess.WHITE))
+        + len(board.pieces(chess.BISHOP, chess.BLACK))
+        + len(board.pieces(chess.ROOK, chess.WHITE))
+        + len(board.pieces(chess.ROOK, chess.BLACK))
+        + len(board.pieces(chess.QUEEN, chess.WHITE))
+        + len(board.pieces(chess.QUEEN, chess.BLACK))
     )
-    
+
     if not has_white_queen and not has_black_queen and non_pawn_pieces <= 8:
         return True
-        
+
     if non_pawn_pieces <= 6:
         return True
-        
+
     return False
+
 
 def analyze_game_and_harvest(game, target_user, engine, opening_plies):
     headers = game.headers
     white_name = headers.get("White", "")
     black_name = headers.get("Black", "")
-    
+
     white_lower = white_name.lower()
     user_lower = target_user.lower()
 
@@ -435,14 +493,29 @@ def analyze_game_and_harvest(game, target_user, engine, opening_plies):
     move_count = 0
 
     target_stats = {
-        "rating": target_rating, "decisions": 0, "cp_loss": 0, "cp_list": [],
-        "t1_matches": 0, "t2_only_matches": 0, "t3_only_matches": 0,
-        "match1_list": [], "match2_only_list": [], "match3_only_list": []
+        "rating": target_rating,
+        "decisions": 0,
+        "cp_loss": 0,
+        "cp_list": [],
+        "t1_matches": 0,
+        "t2_only_matches": 0,
+        "t3_only_matches": 0,
+        "match1_list": [],
+        "match2_only_list": [],
+        "match3_only_list": [],
     }
     opp_stats = {
-        "name": opp_name, "rating": opp_rating, "decisions": 0, "cp_loss": 0, "cp_list": [],
-        "t1_matches": 0, "t2_only_matches": 0, "t3_only_matches": 0,
-        "match1_list": [], "match2_only_list": [], "match3_only_list": []
+        "name": opp_name,
+        "rating": opp_rating,
+        "decisions": 0,
+        "cp_loss": 0,
+        "cp_list": [],
+        "t1_matches": 0,
+        "t2_only_matches": 0,
+        "t3_only_matches": 0,
+        "match1_list": [],
+        "match2_only_list": [],
+        "match3_only_list": [],
     }
 
     eval_limit = chess.engine.Limit(depth=ANALYSIS_DEPTH, time=ANALYSIS_TIME_LIMIT)
@@ -475,13 +548,13 @@ def analyze_game_and_harvest(game, target_user, engine, opening_plies):
                 top_moves.append(pv_line[0])
 
         score_before = analysis_pv_list[0]["score"].pov(current_turn)
-        
+
         if score_before.is_mate():
             board.push(move)
             continue
-            
+
         cp_before = score_before.score(mate_score=10000)
-        
+
         if abs(cp_before) > EVAL_CAP_CENTIPAWNS:
             board.push(move)
             continue
@@ -526,28 +599,43 @@ def analyze_game_and_harvest(game, target_user, engine, opening_plies):
 
     return res_target, res_opp
 
+
 # -----------------------------------------------------------------------------
 # Statistical Engine
 # -----------------------------------------------------------------------------
-def compute_statistical_diagnostics(target_cp, peer_cp, 
-                                     target_m1, peer_m1, 
-                                     target_m2_only, peer_m2_only, 
-                                     target_m3_only, peer_m3_only):
+def compute_statistical_diagnostics(
+    target_cp,
+    peer_cp,
+    target_m1,
+    peer_m1,
+    target_m2_only,
+    peer_m2_only,
+    target_m3_only,
+    peer_m3_only,
+):
     n_t = len(target_cp)
     n_p = len(peer_cp)
-    
+
     if n_t < MIN_PEER_DECISIONS or n_p < MIN_PEER_DECISIONS:
         return None
 
     mean_acpl_t = sum(target_cp) / n_t
     mean_acpl_p = sum(peer_cp) / n_p
-    
+
     sorted_t = sorted(target_cp)
     sorted_p = sorted(peer_cp)
-    median_cpl_t = sorted_t[n_t // 2] if n_t % 2 != 0 else (sorted_t[n_t // 2 - 1] + sorted_t[n_t // 2]) / 2.0
-    median_cpl_p = sorted_p[n_p // 2] if n_p % 2 != 0 else (sorted_p[n_p // 2 - 1] + sorted_p[n_p // 2]) / 2.0
+    median_cpl_t = (
+        sorted_t[n_t // 2]
+        if n_t % 2 != 0
+        else (sorted_t[n_t // 2 - 1] + sorted_t[n_t // 2]) / 2.0
+    )
+    median_cpl_p = (
+        sorted_p[n_p // 2]
+        if n_p % 2 != 0
+        else (sorted_p[n_p // 2 - 1] + sorted_p[n_p // 2]) / 2.0
+    )
 
-    u_stat_cpl, p_val_cpl = stats.mannwhitneyu(target_cp, peer_cp, alternative='two-sided')
+    u_stat_cpl, p_val_cpl = stats.mannwhitneyu(target_cp, peer_cp, alternative="two-sided")
 
     def two_prop_z_test(k1_list, n1, k2_list, n2):
         x1, x2 = sum(k1_list), sum(k2_list)
@@ -573,293 +661,189 @@ def compute_statistical_diagnostics(target_cp, peer_cp,
         "median_cpl_p": median_cpl_p,
         "u_stat_cpl": u_stat_cpl,
         "p_val_cpl": p_val_cpl,
-        "z_m1": z_m1, "p_m1": p_m1, "se_m1": se_m1,
-        "z_m2": z_m2, "p_m2": p_m2, "se_m2": se_m2,
-        "z_m3": z_m3, "p_m3": p_m3, "se_m3": se_m3,
+        "z_m1": z_m1,
+        "p_m1": p_m1,
+        "se_m1": se_m1,
+        "z_m2": z_m2,
+        "p_m2": p_m2,
+        "se_m2": se_m2,
+        "z_m3": z_m3,
+        "p_m3": p_m3,
+        "se_m3": se_m3,
     }
 
-# -----------------------------------------------------------------------------
-# Structured File Logging Engine
-# -----------------------------------------------------------------------------
-def log_audit_results(username, speed_class, exact_tc, target_decisions,
-                      t_decisions, games_analyzed, avg_target_rating,
-                      o_decisions, display_peer_count, min_peer_r, max_peer_r,
-                      engine_name, 
-                      actual_m1_rate, peer_m1_rate,
-                      actual_m2_rate, peer_m2_rate,
-                      actual_m3_rate, peer_m3_rate,
-                      actual_t123_rate, peer_t123_rate,
-                      actual_acpl, peer_acpl, stats_res, active_window, 
-                      log_filepath=None, is_c960=False, is_tour=False, enable_logging=False):
-    """
-    Handles logging of audit results.
-    If enable_logging is False, outputs an info message.
-    If True, writes results to YYMMDDHHMMSS-<username>.log in cwd.
-    """
-    if not enable_logging or not log_filepath:
-        return
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    v_str = "CHESS960 " if is_c960 else ""
-    m_str = "TOURNAMENTS " if is_tour else ""
-    tc_str = f"{v_str}{m_str}{speed_class.upper()} ({exact_tc})" if exact_tc else f"{v_str}{m_str}{speed_class.upper()}"
-    
-    m1_delta = actual_m1_rate - peer_m1_rate
-    m2_delta = actual_m2_rate - peer_m2_rate
-    m3_delta = actual_m3_rate - peer_m3_rate
-    t123_delta = actual_t123_rate - peer_t123_rate
-    acpl_delta = peer_acpl - actual_acpl
-    
-    m1_pct_rel = (m1_delta / peer_m1_rate * 100) if peer_m1_rate > 0 else 0.0
-    t123_pct_rel = (t123_delta / peer_t123_rate * 100) if peer_t123_rate > 0 else 0.0
-    acpl_efficiency_pct = (acpl_delta / peer_acpl * 100) if peer_acpl > 0 else 0.0
-
-    if stats_res:
-        p_cpl = stats_res['p_val_cpl']
-        p_m1 = stats_res['p_m1']
-        z_m1 = stats_res['z_m1']
-        med_t = stats_res['median_cpl_t']
-        med_p = stats_res['median_cpl_p']
-
-        if p_cpl < 0.01 or p_m1 < 0.01:
-            if z_m1 > 3.0 or (p_cpl < 0.001 and med_t < med_p):
-                perf_summary = "ANOMALOUS OVERPERFORMANCE (Engine-like Precision)"
-                eval_text = "[🔥] ANOMALOUS OVERPERFORMANCE: Highly statistically significant divergence from peer baseline."
-            elif z_m1 > 2.0 or (p_cpl < 0.05 and med_t < med_p):
-                perf_summary = "OVER-PERFORMING (Outlier vs Peer Baseline)"
-                eval_text = "[!] OUTLIER PERFORMANCE: Statistically significant superior precision vs peer baseline (p < 0.05)."
-            elif z_m1 < -2.0 or (p_cpl < 0.05 and med_t > med_p):
-                perf_summary = "SUB-PERFORMANCE (Below Expected Peer Baseline)"
-                eval_text = "[▼] SIGNIFICANT UNDERPERFORMANCE: Statistically significant underperformance vs peer baseline."
-            else:
-                perf_summary = "NORMAL PERFORMANCE (Within Standard Human Variance)"
-                eval_text = "[✓] NORMAL VARIANCE: Differences vs peers are within expected statistical limits."
-        else:
-            perf_summary = "NORMAL PERFORMANCE (Within Standard Human Variance)"
-            eval_text = "[✓] NORMAL VARIANCE: Play style sits completely within expectable human variation (p >= 0.05)."
-
-        stats_block = (
-            f"  • CPL Mann-Whitney U  : U = {stats_res['u_stat_cpl']:.1f} | p-value = {p_cpl:.4f}\n"
-            f"  • Median CPL (T vs P) : {med_t:.1f} CP vs {med_p:.1f} CP\n"
-            f"  • T1 Match Z-Score    : {z_m1:+.2f} (p-value = {p_m1:.4f} | SE: {stats_res['se_m1']*100:.2f}%)\n"
-            f"  • T2-Only Z-Score     : {stats_res['z_m2']:+.2f} (p-value = {stats_res['p_m2']:.4f})\n"
-            f"  • T3-Only Z-Score     : {stats_res['z_m3']:+.2f} (p-value = {stats_res['p_m3']:.4f})\n"
-            f"  • EVALUATION RESULT   : {eval_text}\n"
-            f"  • PERFORMANCE SUMMARY : {perf_summary}\n"
-        )
-    else:
-        stats_block = (
-            "  • STATISTICAL RESULT  : INSUFFICIENT VOLUME FOR TESTS\n"
-            "  • PERFORMANCE SUMMARY : UNKNOWN (Insufficient Volume)\n"
-        )
-
-    log_entry = f"""================================================================================
-AUDIT TIMESTAMP : {timestamp}
-TARGET PLAYER   : {username.lower()} (Chess.com) | Avg Rating: {avg_target_rating}
-TIME CONTROL    : {tc_str} | Gathered: {t_decisions} Decisions
-ENGINE MODEL    : {engine_name} (Depth {ANALYSIS_DEPTH}, Time {ANALYSIS_TIME_LIMIT}s, MultiPV 3)
-FILTERS ACTIVE  : Rated Games Only | Strict Paired Sampling
-                 Mode: {'Tournament Field' if is_tour else f'Standard Pool (+/-{active_window} Elo)'}
-                 Opening cut <= {STANDARD_OPENING_BOOK_PLIES//2 if not is_c960 else 0} moves | Eval cap <= |400| CP
-                 Max loss bound = 200 CP
---------------------------------------------------------------------------------
-VOLUMES GATHERED:
-  • Target Decisions : {t_decisions} moves across {games_analyzed} games
-  • Peer Baseline    : {o_decisions} moves across {display_peer_count} opponents | Rating Window: [{min_peer_r}-{max_peer_r}]
-
-PERFORMANCE COMPARISON:
-  Metric               | Target Player | Peer Baseline | Absolute Delta | Relative Change
-  ---------------------|---------------|---------------|----------------|----------------
-  T1 Match Rate        |     {actual_m1_rate:5.1f}%    |     {peer_m1_rate:5.1f}%    |    {m1_delta:+5.1f}%     |    {m1_pct_rel:+6.1f}%
-  T2-Only Match Rate   |     {actual_m2_rate:5.1f}%    |     {peer_m2_rate:5.1f}%    |    {m2_delta:+5.1f}%     |        --
-  T3-Only Match Rate   |     {actual_m3_rate:5.1f}%    |     {peer_m3_rate:5.1f}%    |    {m3_delta:+5.1f}%     |        --
-  Cumulative T123 Rate |     {actual_t123_rate:5.1f}%    |     {peer_t123_rate:5.1f}%    |    {t123_delta:+5.1f}%     |    {t123_pct_rel:+6.1f}%
-  Filtered ACPL (CP)   |     {actual_acpl:5.1f}     |     {peer_acpl:5.1f}     |   {acpl_delta:+5.1f} CP   |   {acpl_efficiency_pct:+6.1f}% (Precision)
-
-EMPIRICAL DIAGNOSTIC:
-  • T1 Match Relative  : {m1_pct_rel:+.1f}% move-choice correlation vs peers
-  • Cumulative T123    : {t123_pct_rel:+.1f}% candidate match rate vs peers
-  • Precision Delta    : {acpl_delta:+.1f} ACPL lower error rate ({acpl_efficiency_pct:+.1f}% accuracy edge)
-
-STATISTICAL DIAGNOSTICS (Mann-Whitney U & Proportion Z-Tests):
-{stats_block}================================================================================
-
-"""
-
-    try:
-        with open(log_filepath, "w", encoding="utf-8") as f:
-            f.write(log_entry)
-        print(f"\n[+] Audit log written to: {log_filepath}")
-    except Exception as e:
-        print(f"\n[!] Error writing to log file: {e}")
-
-# -----------------------------------------------------------------------------
-# Interactive Prompts
-# -----------------------------------------------------------------------------
-def prompt_username():
-    while True:
-        username = input("Chess.com Username: ").strip()
-        if not username:
-            print("[X] Username cannot be blank.")
-            continue
-        
-        print(f"Verifying username '{username}' on Chess.com...")
-        valid, err_msg = validate_username(username)
-        if valid:
-            print(f"[+] Username '{username}' verified successfully.")
-            return username
-        else:
-            print(f"[X] {err_msg} Please try again.")
-
-def prompt_time_control():
-    print("\nSelect Time Control Category:")
-    print(" 1. Blitz [Default]")
-    print(" 2. Rapid")
-    print(" 3. Bullet")
-    print(" 4. Daily")
-    
-    tc_map = {"1": "blitz", "2": "rapid", "3": "bullet", "4": "daily"}
-    
-    while True:
-        tc_input = input("Choice [Default: 1]: ").strip()
-        if tc_input == "":
-            return "blitz"
-        if tc_input in tc_map:
-            return tc_map[tc_input]
-            
-        print(f"[X] Invalid choice. Enter a number between 1 and {len(tc_map)}.")
 
 # -----------------------------------------------------------------------------
 # Main Execution & Reporting
 # -----------------------------------------------------------------------------
 def main():
-    print("==================================================")
-    print(" CHESS.COM PERFORMANCE EVALUATOR")
-    print("==================================================")
-    print("AVAILABLE OPTIONS / CLI FLAGS:")
-    print("  -p, --player <username>      Target Chess.com username")
-    print("  -t, --time-control <type>    blitz | rapid | bullet | daily")
-    print("  -o, --override-window        Expand peer rating window (+/-150 -> +/-250 Elo)")
-    print("  -960, --chess960             Enable Chess960 (Fischer Random) mode")
-    print("  --tournaments [N]            Audit up to N recent tournaments (Default: 5)")
-    print("  --log                        Enable logging to a timestamped file in cwd")
-    print("  -h, --help                   Display help screen and exit")
-    print("==================================================\n")
-
     parser = argparse.ArgumentParser(
         description="Chess.com Performance Evaluator - Evaluates middlegame precision, ACPL, and candidate move correlation against local Stockfish engine baselines.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  python bin/chesscom-perf-eval.py -p Hikaru -t blitz
-  python bin/chesscom-perf-eval.py -p carlos071999 -t blitz -960 --tournaments 5
-  python bin/chesscom-perf-eval.py -p Elwass2 -t rapid -o --log
-  python bin/chesscom-perf-eval.py  (runs in interactive mode)
-"""
+  python chesscom-perf-eval.py Hikaru blitz
+  python chesscom-perf-eval.py GothamChess blitz -960 --tournaments 5
+  python chesscom-perf-eval.py MagnusCarlsen rapid -o --log
+""",
     )
-    parser.add_argument("-p", "--player", metavar="<playername>", help="Target player username on Chess.com", type=str, default=None)
-    parser.add_argument("-t", "--time-control", metavar="<bullet, blitz, rapid, daily>", help="Time control speed category", type=str, default=None)
-    parser.add_argument("-o", "--override-window", action="store_true", help="Expand peer rating window from +/-150 to +/-250 Elo")
-    parser.add_argument("-960", "--chess960", action="store_true", help="Enable Chess960 (Fischer Random) mode")
-    parser.add_argument("--tournaments", nargs="?", const=5, type=int, default=None, help="Audit up to N recent tournaments matching category (Default: 5)")
-    parser.add_argument("--log", action="store_true", help="Enable logging to a timestamped file in the current working directory")
+
+    parser.add_argument(
+        "playername",
+        type=str,
+        help="Target player username on Chess.com",
+    )
+    parser.add_argument(
+        "time_control",
+        type=str,
+        choices=["bullet", "blitz", "rapid", "daily"],
+        help="Speed category: bullet | blitz | rapid | daily",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--override-window",
+        action="store_true",
+        help="Expand peer rating window from +/-150 to +/-250 Elo",
+    )
+    parser.add_argument(
+        "-960",
+        "--chess960",
+        action="store_true",
+        help="Enable Chess960 (Fischer Random) mode",
+    )
+    parser.add_argument(
+        "--tournaments",
+        nargs="?",
+        const=5,
+        type=int,
+        default=None,
+        help="Audit up to N recent tournaments matching category (Default: 5)",
+    )
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help="Enable logging to a timestamped file in the current working directory",
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+
+    # Automatically print full help text if run with no command-line arguments
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
 
     args = parser.parse_args()
 
-    rating_window_val = OVERRIDE_RATING_WINDOW if args.override_window else DEFAULT_RATING_WINDOW
+    # 1. Validate Username
+    raw_user = args.playername.strip()
+    print(f"Verifying username '{raw_user}' on Chess.com...")
+    valid, err_msg = validate_username(raw_user)
+    if not valid:
+        print(f"[X] Error: {err_msg}", file=sys.stderr)
+        sys.exit(1)
+    username = raw_user
+    print(f"[+] Username '{username}' verified successfully.")
+
+    speed_class = args.time_control.strip().lower()
+    rating_window_val = (
+        OVERRIDE_RATING_WINDOW if args.override_window else DEFAULT_RATING_WINDOW
+    )
     is_c960 = args.chess960
-    opening_plies = CHESS960_OPENING_BOOK_PLIES if is_c960 else STANDARD_OPENING_BOOK_PLIES
+    opening_plies = (
+        CHESS960_OPENING_BOOK_PLIES if is_c960 else STANDARD_OPENING_BOOK_PLIES
+    )
     max_tournaments = args.tournaments
     is_tour = max_tournaments is not None
 
-    # 1. Resolve Engine
+    # 2. Resolve Engine
     stockfish_bin = find_stockfish()
     try:
         engine = chess.engine.SimpleEngine.popen_uci(stockfish_bin)
         engine_name = engine.id.get("name", "Stockfish Engine")
-        
+
         if is_c960:
             try:
                 engine.configure({"UCI_Chess960": True})
                 print("[+] Configured Stockfish with 'UCI_Chess960 = true'")
             except Exception:
-                print("[+] Stockfish manages Chess960 automatically (UCI_Chess960 set automatically by engine).")
+                print(
+                    "[+] Stockfish manages Chess960 automatically (UCI_Chess960 set automatically by engine)."
+                )
     except Exception as e:
-        print(f"\nError initializing Stockfish binary at '{stockfish_bin}': {e}")
+        print(f"\nError initializing Stockfish binary at '{stockfish_bin}': {e}", file=sys.stderr)
         if os.path.exists(CONFIG_FILE):
             print(f"Tip: Delete local '{CONFIG_FILE}' to reset the saved path.")
-        return
-
-    # 2. Process Parameters
-    username = None
-    if args.player:
-        raw_user = args.player.strip()
-        print(f"Verifying CLI username '{raw_user}' on Chess.com...")
-        valid, err_msg = validate_username(raw_user)
-        if valid:
-            print(f"[+] Username '{raw_user}' verified successfully.")
-            username = raw_user
-        else:
-            print(f"[X] {err_msg}")
-            username = prompt_username()
-    else:
-        username = prompt_username()
-
-    speed_class = None
-    if args.time_control:
-        val = args.time_control.strip().lower()
-        if val in ["bullet", "blitz", "rapid", "daily"]:
-            speed_class = val
-        else:
-            print(f"[X] Invalid time control category '{args.time_control}'. Expected: bullet, blitz, rapid, or daily.")
-            speed_class = prompt_time_control()
-    else:
-        speed_class = prompt_time_control()
+        sys.exit(1)
 
     # Tournament List Resolution
     tournaments_list = None
     if is_tour:
         tournaments_list = fetch_recent_tournaments(username, max_count=max_tournaments)
         if not tournaments_list:
-            print(f"[!] No completed tournaments found for '{username}' via API.")
-            print("    Please check if the player has finished any tournaments on Chess.com.")
-            return
+            print(f"[!] No completed tournaments found for '{username}' via API.", file=sys.stderr)
+            sys.exit(1)
 
     # 3. Detect Time Control (Skip if in Tournament Mode)
-    exact_time_control = None if is_tour else find_most_frequent_time_control(username, speed_class, is_c960=is_c960)
+    exact_time_control = (
+        None if is_tour else find_most_frequent_time_control(username, speed_class, is_c960=is_c960)
+    )
 
     variant_str = "CHESS960 " if is_c960 else ""
     mode_str = "TOURNAMENTS " if is_tour else ""
     tc_label = f"{variant_str}{mode_str}{speed_class.upper()}"
-    
-    # Prepare Log Filename target
+
+    # Prepare Stream File Target
+    log_file = None
+    log_file_path = None
     clean_user = username.strip().lower()
-    timestamp_prefix = datetime.now().strftime("%y%m%d%H%M%S")
-    log_file_path = os.path.join(os.getcwd(), f"{timestamp_prefix}-{clean_user}.log")
-    
-    print(f"\nEngine Model   : {engine_name} (MultiPV 3)")
-    print(f"Target Volume  : Shoot for {TARGET_MAX_DECISIONS} decisions (Floor: {MIN_PEER_DECISIONS}) [{tc_label}]")
-    print(f"Filters Active : Rated Games Only | Strict Paired Sampling")
-    if is_tour:
-        print(f"                 Mode: Tournament Field (No Elo Cap)")
-    else:
-        print(f"                 Mode: Standard Pool (Excludes Tournaments, +/-{rating_window_val} Elo)")
-    print(f"                 Opening cut <= {opening_plies//2} moves | Eval cap <= |400| CP")
-    print(f"                 Max loss bound = 200 CP")
     if args.log:
-        print(f"Logging Status : Enabled -> {os.path.basename(log_file_path)}")
+        timestamp_prefix = datetime.now().strftime("%y%m%d%H%M%S")
+        log_file_path = os.path.join(os.getcwd(), f"{timestamp_prefix}-{clean_user}.log")
+        try:
+            log_file = open(log_file_path, "w", encoding="utf-8")
+        except OSError as e:
+            print(f"[!] Error opening log file: {e}", file=sys.stderr)
+
+    # Initial Streamed Config Header
+    stream_write(f"\nEngine Model   : {engine_name} (MultiPV 3)", log_file)
+    stream_write(
+        f"Target Volume  : Shoot for {TARGET_MAX_DECISIONS} decisions (Floor: {MIN_PEER_DECISIONS}) [{tc_label}]",
+        log_file,
+    )
+    stream_write("Filters Active : Rated Games Only | Strict Paired Sampling", log_file)
+    if is_tour:
+        stream_write("                 Mode: Tournament Field (No Elo Cap)", log_file)
     else:
-        print(f"Logging Status : Disabled (pass --log to save log in current dir)")
-    print()
+        stream_write(
+            f"                 Mode: Standard Pool (Excludes Tournaments, +/-{rating_window_val} Elo)",
+            log_file,
+        )
+    stream_write(
+        f"                 Opening cut <= {opening_plies//2} moves | Eval cap <= |400| CP",
+        log_file,
+    )
+    stream_write("                 Max loss bound = 200 CP", log_file)
+    if args.log and log_file_path:
+        stream_write(f"Logging Status : Enabled -> {os.path.basename(log_file_path)}", log_file)
+    else:
+        stream_write(
+            "Logging Status : Disabled (pass --log to save log in current dir)", log_file
+        )
+    stream_write("", log_file)
 
     t_decisions, t_cp_loss = 0, 0
     t_t1_matches, t_t2_only_matches, t_t3_only_matches = 0, 0, 0
-    
+
     o_decisions, o_cp_loss = 0, 0
     o_t1_matches, o_t2_only_matches, o_t3_only_matches = 0, 0, 0
 
     t_ratings, o_ratings = [], []
     games_analyzed = 0
-    
+
     target_cp_all, peer_cp_all = [], []
     target_m1_all, peer_m1_all = [], []
     target_m2_only_all, peer_m2_only_all = [], []
@@ -871,53 +855,69 @@ def main():
     def get_current_decisions():
         return t_decisions
 
+    # Print Perfectly Aligned Table Header
+    header_title = (
+        f"{'#':<4} {'Moves':>8} {'T1%':>5} {'T2%':>5} {'T3%':>5} {'T123%':>6} {'ACPL':>6}  Opponent"
+    )
+    header_line = "-" * 71
+    stream_write(header_title, log_file)
+    stream_write(header_line, log_file)
+
     # 4. Stream and Harvest Games
     game_stream = stream_games(
-        username, 
-        speed_class, 
-        exact_tc=exact_time_control, 
-        is_c960=is_c960, 
+        username,
+        speed_class,
+        exact_tc=exact_time_control,
+        is_c960=is_c960,
         tournaments=tournaments_list,
-        current_decisions_callback=get_current_decisions
+        current_decisions_callback=get_current_decisions,
     )
-    
+
     for game in game_stream:
         target_res, opp_res = analyze_game_and_harvest(game, username, engine, opening_plies)
-        
-        if target_res and target_res["decisions"] > 0 and opp_res and opp_res["decisions"] > 0:
+
+        if (
+            target_res
+            and target_res["decisions"] > 0
+            and opp_res
+            and opp_res["decisions"] > 0
+        ):
             opp_name = opp_res["name"]
             opp_clean = opp_name.strip().lower()
             opp_rating = opp_res["rating"]
             target_rating = target_res["rating"]
 
             if opp_clean in harvested_opponents:
-                print(f"[GAME SKIPPED] Opponent '{opp_name}' is a duplicate.")
+                stream_write(f"[SKIPPED] Opponent '{opp_name}' is a duplicate.", log_file)
                 continue
 
             # Standard Pool Mode: Apply strict Elo window filtering
             if not is_tour and abs(opp_rating - target_rating) > rating_window_val:
-                print(f"[GAME SKIPPED] Opponent '{opp_name}' ({opp_rating}) outside rating window (+/- {rating_window_val}).")
+                stream_write(
+                    f"[SKIPPED] Opponent '{opp_name}' ({opp_rating}) outside rating window (+/- {rating_window_val}).",
+                    log_file,
+                )
                 continue
 
             active, status_reason = is_account_active(opp_name)
             if not active:
-                print(f"[GAME SKIPPED] Opponent '{opp_name}' - {status_reason}")
+                stream_write(f"[SKIPPED] Opponent '{opp_name}' - {status_reason}", log_file)
                 continue
 
             # Harvest Data
             harvested_opponents.add(opp_clean)
             games_analyzed += 1
-            
+
             # Target Player
             t_ratings.append(target_rating)
             t_decisions += target_res["decisions"]
             t_cp_loss += target_res["cp_loss"]
             target_cp_all.extend(target_res["cp_list"])
-            
+
             t_t1_matches += target_res["t1_matches"]
             t_t2_only_matches += target_res["t2_only_matches"]
             t_t3_only_matches += target_res["t3_only_matches"]
-            
+
             target_m1_all.extend(target_res["match1_list"])
             target_m2_only_all.extend(target_res["match2_only_list"])
             target_m3_only_all.extend(target_res["match3_only_list"])
@@ -939,31 +939,52 @@ def main():
             g_m1 = (target_res["t1_matches"] / target_res["decisions"]) * 100
             g_m2_only = (target_res["t2_only_matches"] / target_res["decisions"]) * 100
             g_m3_only = (target_res["t3_only_matches"] / target_res["decisions"]) * 100
-            g_t123 = ((target_res["t1_matches"] + target_res["t2_only_matches"] + target_res["t3_only_matches"]) / target_res["decisions"]) * 100
+            g_t123 = (
+                (
+                    target_res["t1_matches"]
+                    + target_res["t2_only_matches"]
+                    + target_res["t3_only_matches"]
+                )
+                / target_res["decisions"]
+            ) * 100
             g_acpl = target_res["cp_loss"] / target_res["decisions"]
-            
-            tour_tag = f" [{game.headers.get('Tournament_Name', '')}]" if is_tour else ""
-            print(f"[{games_analyzed:02d}] vs {opp_name} ({opp_rating}){tour_tag} | +{target_res['decisions']:2d} Dec (Progress: {t_decisions}/{TARGET_MAX_DECISIONS}) | T1: {g_m1:4.1f}% | T2-Only: {g_m2_only:4.1f}% | T3-Only: {g_m3_only:4.1f}% | Cumul T123: {g_t123:4.1f}% | ACPL: {g_acpl:5.1f}")
+
+            tour_tag = (
+                f" [{game.headers.get('Tournament_Name', '')}]" if is_tour else ""
+            )
+            progress_str = f"{t_decisions}/{TARGET_MAX_DECISIONS}"
+
+            row_str = f"[{games_analyzed:02d}] {progress_str:>8} {g_m1:5.1f} {g_m2_only:5.1f} {g_m3_only:5.1f} {g_t123:6.1f} {g_acpl:6.1f}  vs {opp_name} ({opp_rating}){tour_tag}"
+            stream_write(row_str, log_file)
 
     engine.quit()
 
     if t_decisions < MIN_PEER_DECISIONS:
-        print(f"\n[!] Could not gather minimum required decisions ({MIN_PEER_DECISIONS}). Total gathered: {t_decisions}. Exiting.")
-        return
+        stream_write(
+            f"\n[!] Could not gather minimum required decisions ({MIN_PEER_DECISIONS}). Total gathered: {t_decisions}. Exiting.",
+            log_file,
+        )
+        if log_file:
+            log_file.close()
+        sys.exit(1)
 
     # Metrics Summary Calculation
     avg_target_rating = int(sum(t_ratings) / len(t_ratings))
-    
+
     actual_m1_rate = (t_t1_matches / t_decisions) * 100
     actual_m2_rate = (t_t2_only_matches / t_decisions) * 100
     actual_m3_rate = (t_t3_only_matches / t_decisions) * 100
-    actual_t123_rate = ((t_t1_matches + t_t2_only_matches + t_t3_only_matches) / t_decisions) * 100
+    actual_t123_rate = (
+        (t_t1_matches + t_t2_only_matches + t_t3_only_matches) / t_decisions
+    ) * 100
     actual_acpl = t_cp_loss / t_decisions
 
     peer_m1_rate = (o_t1_matches / o_decisions) * 100 if o_decisions > 0 else 0.0
     peer_m2_rate = (o_t2_only_matches / o_decisions) * 100 if o_decisions > 0 else 0.0
     peer_m3_rate = (o_t3_only_matches / o_decisions) * 100 if o_decisions > 0 else 0.0
-    peer_t123_rate = ((o_t1_matches + o_t2_only_matches + o_t3_only_matches) / o_decisions) * 100 if o_decisions > 0 else 0.0
+    peer_t123_rate = (
+        (o_t1_matches + o_t2_only_matches + o_t3_only_matches) / o_decisions
+    ) * 100 if o_decisions > 0 else 0.0
     peer_acpl = o_cp_loss / o_decisions if o_decisions > 0 else 0.0
 
     # Percentages & Deltas
@@ -976,103 +997,183 @@ def main():
     m1_pct_rel = (m1_delta / peer_m1_rate * 100) if peer_m1_rate > 0 else 0.0
     t123_pct_rel = (t123_delta / peer_t123_rate * 100) if peer_t123_rate > 0 else 0.0
     acpl_efficiency_pct = (acpl_delta / peer_acpl * 100) if peer_acpl > 0 else 0.0
-    
+
     min_peer_r = min(o_ratings) if o_ratings else avg_target_rating - rating_window_val
     max_peer_r = max(o_ratings) if o_ratings else avg_target_rating + rating_window_val
     display_peer_count = len(harvested_opponents - {clean_user})
 
-    print("\n" + "=" * 78)
-    print(f" EMPIRICAL EVALUATION REPORT: {username} (Chess.com)")
-    print("=" * 78)
-    print(f" Engine Model   : {engine_name} (MultiPV 3)")
-    print(f" Target Volume  : {t_decisions} Non-Forced Decisions ({tc_label})")
-    print(f" Filters Active : Rated Games Only | Strict Paired Sampling")
+    # Output Final Report Block
+    stream_write("\n" + "=" * 78, log_file)
+    stream_write(f" EMPIRICAL EVALUATION REPORT: {username} (Chess.com) [v{__version__}]", log_file)
+    stream_write("=" * 78, log_file)
+    stream_write(f" Engine Model   : {engine_name} (MultiPV 3)", log_file)
+    stream_write(
+        f" Target Volume  : {t_decisions} Non-Forced Decisions ({tc_label})", log_file
+    )
+    stream_write(" Filters Active : Rated Games Only | Strict Paired Sampling", log_file)
     if is_tour:
-        print(f"                 Mode: Tournament Field (No Elo Cap)")
+        stream_write("                 Mode: Tournament Field (No Elo Cap)", log_file)
     else:
-        print(f"                 Mode: Standard Pool (+/-{rating_window_val} Elo)")
-    print(f"                 Opening cut <= {opening_plies//2} moves | Eval cap <= |400| CP")
-    print(f"                 Max loss bound = 200 CP")
-    if args.log:
-        print(f" Logging Status : Enabled -> {os.path.basename(log_file_path)}")
+        stream_write(
+            f"                 Mode: Standard Pool (+/-{rating_window_val} Elo)", log_file
+        )
+    stream_write(
+        f"                 Opening cut <= {opening_plies//2} moves | Eval cap <= |400| CP",
+        log_file,
+    )
+    stream_write("                 Max loss bound = 200 CP", log_file)
+    if args.log and log_file_path:
+        stream_write(f" Logging Status : Enabled -> {os.path.basename(log_file_path)}", log_file)
     else:
-        print(f" Logging Status : Disabled (pass --log to save log in current dir)")
-    print("-" * 78)
-    print(f" Platform / Category    : Chess.com ({variant_str}{mode_str}{speed_class.upper()})")
-    print(f" Specific Time Control  : {'Tournament Pool' if is_tour else exact_time_control if exact_time_control else 'All in Category'}")
-    print(f" Target Decisions       : {t_decisions} moves across {games_analyzed} valid games")
-    print(f" Peer Baseline Volume   : {o_decisions} moves across {display_peer_count} active opponents")
-    print(f" Peer Rating Window     : [{min_peer_r} to {max_peer_r}]")
-    print("-" * 78)
-    print(" PERFORMANCE METRICS     |  TARGET PLAYER  | PEER BASELINE | ABS DELTA | REL CHANGE")
-    print("-" * 78)
-    print(f" T1 Match Rate          |      {actual_m1_rate:5.1f}%       |     {peer_m1_rate:5.1f}%     |   {m1_delta:+5.1f}%   |  {m1_pct_rel:+6.1f}%")
-    print(f" T2-Only Match Rate     |      {actual_m2_rate:5.1f}%       |     {peer_m2_rate:5.1f}%     |   {m2_delta:+5.1f}%   |      --")
-    print(f" T3-Only Match Rate     |      {actual_m3_rate:5.1f}%       |     {peer_m3_rate:5.1f}%     |   {m3_delta:+5.1f}%   |      --")
-    print(f" Cumulative T123 Rate   |      {actual_t123_rate:5.1f}%       |     {peer_t123_rate:5.1f}%     |   {t123_delta:+5.1f}%   |  {t123_pct_rel:+6.1f}%")
-    print(f" Filtered ACPL (CP)     |      {actual_acpl:5.1f}        |     {peer_acpl:5.1f}      |  {acpl_delta:+5.1f} CP  |  {acpl_efficiency_pct:+6.1f}% (Precision)")
-    print("-" * 78)
-    
-    print("\nEMPIRICAL DIAGNOSTIC:")
-    print(f" • T1 Delta (Move 1)   : {m1_delta:+.1f}% points vs peers ({m1_pct_rel:+.1f}% relative performance)")
-    print(f" • Cumulative T123     : {t123_delta:+.1f}% points vs peers ({t123_pct_rel:+.1f}% candidate match correlation)")
-    print(f" • Precision Edge      : {acpl_delta:+.1f} lower centipawn error rate ({acpl_efficiency_pct:+.1f}% superior accuracy vs peers)")
+        stream_write(
+            " Logging Status : Disabled (pass --log to save log in current dir)", log_file
+        )
+    stream_write("-" * 78, log_file)
+    stream_write(
+        f" Platform / Category    : Chess.com ({variant_str}{mode_str}{speed_class.upper()})",
+        log_file,
+    )
+    stream_write(
+        f" Specific Time Control  : {'Tournament Pool' if is_tour else exact_time_control if exact_time_control else 'All in Category'}",
+        log_file,
+    )
+    stream_write(
+        f" Target Decisions       : {t_decisions} moves across {games_analyzed} valid games",
+        log_file,
+    )
+    stream_write(
+        f" Peer Baseline Volume   : {o_decisions} moves across {display_peer_count} active opponents",
+        log_file,
+    )
+    stream_write(f" Peer Rating Window     : [{min_peer_r} to {max_peer_r}]", log_file)
+    stream_write("-" * 78, log_file)
+    stream_write(
+        " PERFORMANCE METRICS     |  TARGET PLAYER  | PEER BASELINE | ABS DELTA | REL CHANGE",
+        log_file,
+    )
+    stream_write("-" * 78, log_file)
+    stream_write(
+        f" T1 Match Rate          |      {actual_m1_rate:5.1f}%       |     {peer_m1_rate:5.1f}%     |   {m1_delta:+5.1f}%   |  {m1_pct_rel:+6.1f}%",
+        log_file,
+    )
+    stream_write(
+        f" T2-Only Match Rate     |      {actual_m2_rate:5.1f}%       |     {peer_m2_rate:5.1f}%     |   {m2_delta:+5.1f}%   |      --",
+        log_file,
+    )
+    stream_write(
+        f" T3-Only Match Rate     |      {actual_m3_rate:5.1f}%       |     {peer_m3_rate:5.1f}%     |   {m3_delta:+5.1f}%   |      --",
+        log_file,
+    )
+    stream_write(
+        f" Cumulative T123 Rate   |      {actual_t123_rate:5.1f}%       |     {peer_t123_rate:5.1f}%     |   {t123_delta:+5.1f}%   |  {t123_pct_rel:+6.1f}%",
+        log_file,
+    )
+    stream_write(
+        f" Filtered ACPL (CP)     |      {actual_acpl:5.1f}        |     {peer_acpl:5.1f}      |  {acpl_delta:+5.1f} CP  |  {acpl_efficiency_pct:+6.1f}% (Precision)",
+        log_file,
+    )
+    stream_write("-" * 78, log_file)
+
+    stream_write("\nEMPIRICAL DIAGNOSTIC:", log_file)
+    stream_write(
+        f" • T1 Delta (Move 1)   : {m1_delta:+.1f}% points vs peers ({m1_pct_rel:+.1f}% relative performance)",
+        log_file,
+    )
+    stream_write(
+        f" • Cumulative T123     : {t123_delta:+.1f}% points vs peers ({t123_pct_rel:+.1f}% candidate match correlation)",
+        log_file,
+    )
+    stream_write(
+        f" • Precision Edge      : {acpl_delta:+.1f} lower centipawn error rate ({acpl_efficiency_pct:+.1f}% superior accuracy vs peers)",
+        log_file,
+    )
 
     # Statistical Diagnostics
     stats_res = compute_statistical_diagnostics(
-        target_cp_all, peer_cp_all,
-        target_m1_all, peer_m1_all,
-        target_m2_only_all, peer_m2_only_all,
-        target_m3_only_all, peer_m3_only_all
+        target_cp_all,
+        peer_cp_all,
+        target_m1_all,
+        peer_m1_all,
+        target_m2_only_all,
+        peer_m2_only_all,
+        target_m3_only_all,
+        peer_m3_only_all,
     )
-    
-    print("-" * 78)
-    print(" STATISTICAL DIAGNOSTICS (Mann-Whitney U & Proportion Z-Tests)")
-    print("-" * 78)
+
+    stream_write("-" * 78, log_file)
+    stream_write(" STATISTICAL DIAGNOSTICS (Mann-Whitney U & Proportion Z-Tests)", log_file)
+    stream_write("-" * 78, log_file)
     if stats_res:
         p_cpl = stats_res["p_val_cpl"]
         p_m1 = stats_res["p_m1"]
         z_m1 = stats_res["z_m1"]
         med_t = stats_res["median_cpl_t"]
         med_p = stats_res["median_cpl_p"]
-        
-        print(f" • CPL Mann-Whitney U    : U = {stats_res['u_stat_cpl']:.1f} | p-value = {p_cpl:.4f}")
-        print(f" • Median CPL (Target/Peer) : {med_t:.1f} CP vs {med_p:.1f} CP")
-        print(f" • T1 Match Z-Score     : {z_m1:+.2f}  (p-value = {p_m1:.4f} | SE: {stats_res['se_m1']*100:.2f}%)")
-        print(f" • T2-Only Z-Score      : {stats_res['z_m2']:+.2f}  (p-value = {stats_res['p_m2']:.4f})")
-        print(f" • T3-Only Z-Score      : {stats_res['z_m3']:+.2f}  (p-value = {stats_res['p_m3']:.4f})")
-        
-        print("\nSTATISTICAL EVALUATION:")
+
+        stream_write(
+            f" • CPL Mann-Whitney U    : U = {stats_res['u_stat_cpl']:.1f} | p-value = {p_cpl:.4f}",
+            log_file,
+        )
+        stream_write(
+            f" • Median CPL (Target/Peer) : {med_t:.1f} CP vs {med_p:.1f} CP",
+            log_file,
+        )
+        stream_write(
+            f" • T1 Match Z-Score     : {z_m1:+.2f}  (p-value = {p_m1:.4f} | SE: {stats_res['se_m1']*100:.2f}%)",
+            log_file,
+        )
+        stream_write(
+            f" • T2-Only Z-Score      : {stats_res['z_m2']:+.2f}  (p-value = {stats_res['p_m2']:.4f})",
+            log_file,
+        )
+        stream_write(
+            f" • T3-Only Z-Score      : {stats_res['z_m3']:+.2f}  (p-value = {stats_res['p_m3']:.4f})",
+            log_file,
+        )
+
+        stream_write("\nSTATISTICAL EVALUATION:", log_file)
         if p_cpl < 0.01 or p_m1 < 0.01:
             if z_m1 > 3.0 or (p_cpl < 0.001 and med_t < med_p):
-                print(" [🔥] ANOMALOUS OVERPERFORMANCE: Highly statistically significant divergence from peer baseline.")
+                stream_write(
+                    " [🔥] ANOMALOUS OVERPERFORMANCE: Highly statistically significant divergence from peer baseline.",
+                    log_file,
+                )
             elif z_m1 > 2.0 or (p_cpl < 0.05 and med_t < med_p):
-                print(" [!] OUTLIER PERFORMANCE: Statistically significant superior precision vs peer baseline (p < 0.05).")
+                stream_write(
+                    " [!] OUTLIER PERFORMANCE: Statistically significant superior precision vs peer baseline (p < 0.05).",
+                    log_file,
+                )
             elif z_m1 < -2.0 or (p_cpl < 0.05 and med_t > med_p):
-                print(" [▼] SIGNIFICANT UNDERPERFORMANCE: Statistically significant underperformance vs peer baseline.")
+                stream_write(
+                    " [▼] SIGNIFICANT UNDERPERFORMANCE: Statistically significant underperformance vs peer baseline.",
+                    log_file,
+                )
             else:
-                print(" [✓] NORMAL VARIANCE: Differences vs peers are within expected statistical limits.")
+                stream_write(
+                    " [✓] NORMAL VARIANCE: Differences vs peers are within expected statistical limits.",
+                    log_file,
+                )
         else:
-            print(" [✓] NORMAL VARIANCE: Play style sits completely within expectable human variation (p >= 0.05).")
+            stream_write(
+                " [✓] NORMAL VARIANCE: Play style sits completely within expectable human variation (p >= 0.05).",
+                log_file,
+            )
     else:
-        print(f" [!] INSUFFICIENT DECISION VOLUME FOR STATISTICAL TESTS")
-        print(f"     • Target Player Decisions : {t_decisions} moves (Required: {MIN_PEER_DECISIONS}+)")
-        print(f"     • Peer Baseline Decisions : {o_decisions} moves (Required: {MIN_PEER_DECISIONS}+)")
-    print("=" * 78)
+        stream_write(" [!] INSUFFICIENT DECISION VOLUME FOR STATISTICAL TESTS", log_file)
+        stream_write(
+            f"     • Target Player Decisions : {t_decisions} moves (Required: {MIN_PEER_DECISIONS}+)",
+            log_file,
+        )
+        stream_write(
+            f"     • Peer Baseline Decisions : {o_decisions} moves (Required: {MIN_PEER_DECISIONS}+)",
+            log_file,
+        )
+    stream_write("=" * 78, log_file)
 
-    # Write file output if --log flag was supplied
-    log_audit_results(
-        username, speed_class, exact_time_control, TARGET_MAX_DECISIONS,
-        t_decisions, games_analyzed, avg_target_rating,
-        o_decisions, display_peer_count, min_peer_r, max_peer_r,
-        engine_name, 
-        actual_m1_rate, peer_m1_rate,
-        actual_m2_rate, peer_m2_rate,
-        actual_m3_rate, peer_m3_rate,
-        actual_t123_rate, peer_t123_rate,
-        actual_acpl, peer_acpl, stats_res, rating_window_val, 
-        log_filepath=log_file_path, is_c960=is_c960, is_tour=is_tour, enable_logging=args.log
-    )
+    if log_file:
+        log_file.close()
+        print(f"\n[+] Audit log cleanly written to: {log_file_path}")
+
 
 if __name__ == "__main__":
     main()
