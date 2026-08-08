@@ -11,6 +11,7 @@ Usage Options (CLI Parameters):
   -o, --override-window                         Expand peer rating window from +/-150 to +/-250 Elo.
   -960, --chess960                              Enable Chess960 (Fischer Random) mode.
   --tournaments [N]                             Audit up to N recent tournaments in category (Default: 5).
+  --log                                         Enable logging to a timestamped file in cwd.
   -h, --help                                    Show the help screen and exit.
 
 Interactive Prompting:
@@ -588,13 +589,16 @@ def log_audit_results(username, speed_class, exact_tc, target_decisions,
                       actual_m2_rate, peer_m2_rate,
                       actual_m3_rate, peer_m3_rate,
                       actual_t123_rate, peer_t123_rate,
-                      actual_acpl, peer_acpl, stats_res, active_window, is_c960=False, is_tour=False):
-    log_dir = os.path.expanduser("~/Documents/Chess/chess_performance_logs")
-    os.makedirs(log_dir, exist_ok=True)
-    
-    clean_user = username.strip().lower()
-    log_file_path = os.path.join(log_dir, f"{clean_user}.log")
-    
+                      actual_acpl, peer_acpl, stats_res, active_window, 
+                      log_filepath=None, is_c960=False, is_tour=False, enable_logging=False):
+    """
+    Handles logging of audit results.
+    If enable_logging is False, outputs an info message.
+    If True, writes results to YYMMDDHHMMSS-<username>.log in cwd.
+    """
+    if not enable_logging or not log_filepath:
+        return
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     v_str = "CHESS960 " if is_c960 else ""
     m_str = "TOURNAMENTS " if is_tour else ""
@@ -651,10 +655,13 @@ def log_audit_results(username, speed_class, exact_tc, target_decisions,
 
     log_entry = f"""================================================================================
 AUDIT TIMESTAMP : {timestamp}
-TARGET PLAYER   : {clean_user} (Chess.com) | Avg Rating: {avg_target_rating}
+TARGET PLAYER   : {username.lower()} (Chess.com) | Avg Rating: {avg_target_rating}
 TIME CONTROL    : {tc_str} | Gathered: {t_decisions} Decisions
 ENGINE MODEL    : {engine_name} (Depth {ANALYSIS_DEPTH}, Time {ANALYSIS_TIME_LIMIT}s, MultiPV 3)
-FILTERS ACTIVE  : Rated Games Only | Strict Paired Sampling | Mode: {'Tournament Field' if is_tour else f'Peer Window +/-{active_window} Elo'} | Eval cap <= |400| CP
+FILTERS ACTIVE  : Rated Games Only | Strict Paired Sampling
+                 Mode: {'Tournament Field' if is_tour else f'Standard Pool (+/-{active_window} Elo)'}
+                 Opening cut <= {STANDARD_OPENING_BOOK_PLIES//2 if not is_c960 else 0} moves | Eval cap <= |400| CP
+                 Max loss bound = 200 CP
 --------------------------------------------------------------------------------
 VOLUMES GATHERED:
   • Target Decisions : {t_decisions} moves across {games_analyzed} games
@@ -680,9 +687,9 @@ STATISTICAL DIAGNOSTICS (Mann-Whitney U & Proportion Z-Tests):
 """
 
     try:
-        with open(log_file_path, "a", encoding="utf-8") as f:
+        with open(log_filepath, "w", encoding="utf-8") as f:
             f.write(log_entry)
-        print(f"\n[+] Audit result appended to: {log_file_path}")
+        print(f"\n[+] Audit log written to: {log_filepath}")
     except Exception as e:
         print(f"\n[!] Error writing to log file: {e}")
 
@@ -735,6 +742,7 @@ def main():
     print("  -o, --override-window        Expand peer rating window (+/-150 -> +/-250 Elo)")
     print("  -960, --chess960             Enable Chess960 (Fischer Random) mode")
     print("  --tournaments [N]            Audit up to N recent tournaments (Default: 5)")
+    print("  --log                        Enable logging to a timestamped file in cwd")
     print("  -h, --help                   Display help screen and exit")
     print("==================================================\n")
 
@@ -744,7 +752,7 @@ def main():
         epilog="""Examples:
   python bin/chesscom-perf-eval.py -p Hikaru -t blitz
   python bin/chesscom-perf-eval.py -p carlos071999 -t blitz -960 --tournaments 5
-  python bin/chesscom-perf-eval.py -p Elwass2 -t rapid -o
+  python bin/chesscom-perf-eval.py -p Elwass2 -t rapid -o --log
   python bin/chesscom-perf-eval.py  (runs in interactive mode)
 """
     )
@@ -753,6 +761,7 @@ def main():
     parser.add_argument("-o", "--override-window", action="store_true", help="Expand peer rating window from +/-150 to +/-250 Elo")
     parser.add_argument("-960", "--chess960", action="store_true", help="Enable Chess960 (Fischer Random) mode")
     parser.add_argument("--tournaments", nargs="?", const=5, type=int, default=None, help="Audit up to N recent tournaments matching category (Default: 5)")
+    parser.add_argument("--log", action="store_true", help="Enable logging to a timestamped file in the current working directory")
 
     args = parser.parse_args()
 
@@ -822,9 +831,25 @@ def main():
     mode_str = "TOURNAMENTS " if is_tour else ""
     tc_label = f"{variant_str}{mode_str}{speed_class.upper()}"
     
+    # Prepare Log Filename target
+    clean_user = username.strip().lower()
+    timestamp_prefix = datetime.now().strftime("%y%m%d%H%M%S")
+    log_file_path = os.path.join(os.getcwd(), f"{timestamp_prefix}-{clean_user}.log")
+    
     print(f"\nEngine Model   : {engine_name} (MultiPV 3)")
     print(f"Target Volume  : Shoot for {TARGET_MAX_DECISIONS} decisions (Floor: {MIN_PEER_DECISIONS}) [{tc_label}]")
-    print(f"Filters Active : Rated Games Only | Strict Paired Sampling | Mode: {'Tournament Field (No Elo Cap)' if is_tour else f'Standard Pool (Excludes Tournaments, +/-{rating_window_val} Elo)'} | Opening cut <= {opening_plies//2} moves | Eval cap <= |400| CP | Max loss bound = 200 CP\n")
+    print(f"Filters Active : Rated Games Only | Strict Paired Sampling")
+    if is_tour:
+        print(f"                 Mode: Tournament Field (No Elo Cap)")
+    else:
+        print(f"                 Mode: Standard Pool (Excludes Tournaments, +/-{rating_window_val} Elo)")
+    print(f"                 Opening cut <= {opening_plies//2} moves | Eval cap <= |400| CP")
+    print(f"                 Max loss bound = 200 CP")
+    if args.log:
+        print(f"Logging Status : Enabled -> {os.path.basename(log_file_path)}")
+    else:
+        print(f"Logging Status : Disabled (pass --log to save log in current dir)")
+    print()
 
     t_decisions, t_cp_loss = 0, 0
     t_t1_matches, t_t2_only_matches, t_t3_only_matches = 0, 0, 0
@@ -841,8 +866,7 @@ def main():
     target_m3_only_all, peer_m3_only_all = [], []
 
     harvested_opponents = set()
-    target_clean = username.strip().lower()
-    harvested_opponents.add(target_clean)
+    harvested_opponents.add(clean_user)
 
     def get_current_decisions():
         return t_decisions
@@ -955,14 +979,24 @@ def main():
     
     min_peer_r = min(o_ratings) if o_ratings else avg_target_rating - rating_window_val
     max_peer_r = max(o_ratings) if o_ratings else avg_target_rating + rating_window_val
-    display_peer_count = len(harvested_opponents - {target_clean})
+    display_peer_count = len(harvested_opponents - {clean_user})
 
     print("\n" + "=" * 78)
     print(f" EMPIRICAL EVALUATION REPORT: {username} (Chess.com)")
     print("=" * 78)
     print(f" Engine Model   : {engine_name} (MultiPV 3)")
     print(f" Target Volume  : {t_decisions} Non-Forced Decisions ({tc_label})")
-    print(f" Filters Active : Rated Games Only | Strict Paired Sampling | Mode: {'Tournament Field' if is_tour else f'Standard Pool (+/-{rating_window_val} Elo)'} | Opening cut <= {opening_plies//2} moves | Eval cap <= |400| CP")
+    print(f" Filters Active : Rated Games Only | Strict Paired Sampling")
+    if is_tour:
+        print(f"                 Mode: Tournament Field (No Elo Cap)")
+    else:
+        print(f"                 Mode: Standard Pool (+/-{rating_window_val} Elo)")
+    print(f"                 Opening cut <= {opening_plies//2} moves | Eval cap <= |400| CP")
+    print(f"                 Max loss bound = 200 CP")
+    if args.log:
+        print(f" Logging Status : Enabled -> {os.path.basename(log_file_path)}")
+    else:
+        print(f" Logging Status : Disabled (pass --log to save log in current dir)")
     print("-" * 78)
     print(f" Platform / Category    : Chess.com ({variant_str}{mode_str}{speed_class.upper()})")
     print(f" Specific Time Control  : {'Tournament Pool' if is_tour else exact_time_control if exact_time_control else 'All in Category'}")
@@ -1026,7 +1060,7 @@ def main():
         print(f"     • Peer Baseline Decisions : {o_decisions} moves (Required: {MIN_PEER_DECISIONS}+)")
     print("=" * 78)
 
-    # Automatically log results
+    # Write file output if --log flag was supplied
     log_audit_results(
         username, speed_class, exact_time_control, TARGET_MAX_DECISIONS,
         t_decisions, games_analyzed, avg_target_rating,
@@ -1036,7 +1070,8 @@ def main():
         actual_m2_rate, peer_m2_rate,
         actual_m3_rate, peer_m3_rate,
         actual_t123_rate, peer_t123_rate,
-        actual_acpl, peer_acpl, stats_res, rating_window_val, is_c960=is_c960, is_tour=is_tour
+        actual_acpl, peer_acpl, stats_res, rating_window_val, 
+        log_filepath=log_file_path, is_c960=is_c960, is_tour=is_tour, enable_logging=args.log
     )
 
 if __name__ == "__main__":
