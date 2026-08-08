@@ -6,9 +6,7 @@ Terminal utilities for analyzing Chess.com account data, game archives, and perf
 
 ## Overview
 
-This repository contains standalone Python tools for chess data analysis. All executable utilities are located inside the [**`bin/`**](./bin) directory listed in the file browser above.
-
-You can inspect the [**`bin/`**](./bin) directory to browse available tools, or run any script directly from your terminal with the `--help` flag for detailed usage and flags.
+This repository contains standalone Python tools for chess data analysis, all located inside the [**`bin/`**](./bin) directory above. Run any script with the `--help` flag for detailed usage and options.
 
 Example:
     <script-name.py> --help
