@@ -6,17 +6,9 @@ Terminal utilities for analyzing Chess.com account data, game archives, and perf
 
 ## Overview
 
-This repository contains standalone Python tools for chess data analysis. All executable scripts are located inside the [**`bin/`**](./bin) directory.
+This repository contains standalone Python tools for chess data analysis. All executable utilities are located inside the [**`bin/`**](./bin) directory listed in the file browser above.
+
+You can inspect the [**`bin/`**](./bin) directory to browse available tools, or run any script directly from your terminal with the `--help` flag for detailed usage and flags.
 
 Example:
-    chess-perf-eval.py --help
-
----
-
-## Available Tools
-
-All scripts are located in the [**`bin/`**](./bin) directory link above.
-
-| Script                                           | Description                                                           |
-| :---                                             | :---                                                                  |
-| [`chess-perf-eval.py`](./bin/chess-perf-eval.py) | Analyzes performance metrics, rating trends, and account archive data |
+    <script-name.py> --help
