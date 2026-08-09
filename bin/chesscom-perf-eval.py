@@ -39,7 +39,7 @@ import chess.engine
 import chess.pgn
 
 # Version Metadata
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 # System Configuration
 CONFIG_FILE = os.path.join(os.getcwd(), "engine_config.json")
@@ -808,31 +808,26 @@ def main():
         except OSError as e:
             print(f"[!] Error opening log file: {e}", file=sys.stderr)
 
-    # Initial Streamed Config Header
-    stream_write(f"\nEngine Model   : {engine_name} (MultiPV 3)", log_file)
-    stream_write(
-        f"Target Volume  : Shoot for {TARGET_MAX_DECISIONS} decisions (Floor: {MIN_PEER_DECISIONS}) [{tc_label}]",
-        log_file,
-    )
-    stream_write("Filters Active : Rated Games Only | Strict Paired Sampling", log_file)
+    # Write RUN HEADER at the top of log file and console
+    stream_write("=" * 78, log_file)
+    stream_write(f" CHESS.COM PERFORMANCE EVALUATION [v{__version__}]", log_file)
+    stream_write("=" * 78, log_file)
+    stream_write(f" Timestamp      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", log_file)
+    stream_write(f" Target Player  : {username}", log_file)
+    stream_write(f" Engine Model   : {engine_name} (MultiPV 3)", log_file)
+    stream_write(f" Target Volume  : Shoot for {TARGET_MAX_DECISIONS} decisions (Floor: {MIN_PEER_DECISIONS}) [{tc_label}]", log_file)
+    stream_write(" Active Filters : Rated Games Only | Strict Paired Sampling", log_file)
     if is_tour:
-        stream_write("                 Mode: Tournament Field (No Elo Cap)", log_file)
+        stream_write("                  Mode: Tournament Field (No Elo Cap)", log_file)
     else:
-        stream_write(
-            f"                 Mode: Standard Pool (Excludes Tournaments, +/-{rating_window_val} Elo)",
-            log_file,
-        )
-    stream_write(
-        f"                 Opening cut <= {opening_plies//2} moves | Eval cap <= |400| CP",
-        log_file,
-    )
-    stream_write("                 Max loss bound = 200 CP", log_file)
+        stream_write(f"                  Mode: Standard Pool (+/-{rating_window_val} Elo)", log_file)
+    stream_write(f"                  Opening Cut <= {opening_plies//2} moves | Eval Cap <= |400| CP", log_file)
+    stream_write("                  Max Loss Bound = 200 CP", log_file)
     if args.log and log_file_path:
-        stream_write(f"Logging Status : Enabled -> {os.path.basename(log_file_path)}", log_file)
+        stream_write(f" Logging Status : Enabled -> {os.path.basename(log_file_path)}", log_file)
     else:
-        stream_write(
-            "Logging Status : Disabled (pass --log to save log in current dir)", log_file
-        )
+        stream_write(" Logging Status : Disabled (pass --log to save log)", log_file)
+    stream_write("-" * 78, log_file)
     stream_write("", log_file)
 
     t_decisions, t_cp_loss = 0, 0
@@ -855,7 +850,7 @@ def main():
     def get_current_decisions():
         return t_decisions
 
-    # Print Perfectly Aligned Table Header
+    # Print Progress Table Header
     header_title = (
         f"{'#':<4} {'Moves':>8} {'T1%':>5} {'T2%':>5} {'T3%':>5} {'T123%':>6} {'ACPL':>6}  Opponent"
     )
@@ -1002,37 +997,10 @@ def main():
     max_peer_r = max(o_ratings) if o_ratings else avg_target_rating + rating_window_val
     display_peer_count = len(harvested_opponents - {clean_user})
 
-    # Output Final Report Block
+    # Output Final Report Block (Clean Summary - No duplicate config repetition)
     stream_write("\n" + "=" * 78, log_file)
-    stream_write(f" EMPIRICAL EVALUATION REPORT: {username} (Chess.com) [v{__version__}]", log_file)
+    stream_write(f" SUMMARY EVALUATION REPORT: {username} ({tc_label})", log_file)
     stream_write("=" * 78, log_file)
-    stream_write(f" Engine Model   : {engine_name} (MultiPV 3)", log_file)
-    stream_write(
-        f" Target Volume  : {t_decisions} Non-Forced Decisions ({tc_label})", log_file
-    )
-    stream_write(" Filters Active : Rated Games Only | Strict Paired Sampling", log_file)
-    if is_tour:
-        stream_write("                 Mode: Tournament Field (No Elo Cap)", log_file)
-    else:
-        stream_write(
-            f"                 Mode: Standard Pool (+/-{rating_window_val} Elo)", log_file
-        )
-    stream_write(
-        f"                 Opening cut <= {opening_plies//2} moves | Eval cap <= |400| CP",
-        log_file,
-    )
-    stream_write("                 Max loss bound = 200 CP", log_file)
-    if args.log and log_file_path:
-        stream_write(f" Logging Status : Enabled -> {os.path.basename(log_file_path)}", log_file)
-    else:
-        stream_write(
-            " Logging Status : Disabled (pass --log to save log in current dir)", log_file
-        )
-    stream_write("-" * 78, log_file)
-    stream_write(
-        f" Platform / Category    : Chess.com ({variant_str}{mode_str}{speed_class.upper()})",
-        log_file,
-    )
     stream_write(
         f" Specific Time Control  : {'Tournament Pool' if is_tour else exact_time_control if exact_time_control else 'All in Category'}",
         log_file,
@@ -1045,7 +1013,7 @@ def main():
         f" Peer Baseline Volume   : {o_decisions} moves across {display_peer_count} active opponents",
         log_file,
     )
-    stream_write(f" Peer Rating Window     : [{min_peer_r} to {max_peer_r}]", log_file)
+    stream_write(f" Peer Rating Range      : [{min_peer_r} to {max_peer_r}] (Avg Target: {avg_target_rating})", log_file)
     stream_write("-" * 78, log_file)
     stream_write(
         " PERFORMANCE METRICS     |  TARGET PLAYER  | PEER BASELINE | ABS DELTA | REL CHANGE",
@@ -1070,21 +1038,6 @@ def main():
     )
     stream_write(
         f" Filtered ACPL (CP)     |      {actual_acpl:5.1f}        |     {peer_acpl:5.1f}      |  {acpl_delta:+5.1f} CP  |  {acpl_efficiency_pct:+6.1f}% (Precision)",
-        log_file,
-    )
-    stream_write("-" * 78, log_file)
-
-    stream_write("\nEMPIRICAL DIAGNOSTIC:", log_file)
-    stream_write(
-        f" • T1 Delta (Move 1)   : {m1_delta:+.1f}% points vs peers ({m1_pct_rel:+.1f}% relative performance)",
-        log_file,
-    )
-    stream_write(
-        f" • Cumulative T123     : {t123_delta:+.1f}% points vs peers ({t123_pct_rel:+.1f}% candidate match correlation)",
-        log_file,
-    )
-    stream_write(
-        f" • Precision Edge      : {acpl_delta:+.1f} lower centipawn error rate ({acpl_efficiency_pct:+.1f}% superior accuracy vs peers)",
         log_file,
     )
 
@@ -1131,7 +1084,7 @@ def main():
             log_file,
         )
 
-        stream_write("\nSTATISTICAL EVALUATION:", log_file)
+        stream_write("\nEVALUATION:", log_file)
         if p_cpl < 0.01 or p_m1 < 0.01:
             if z_m1 > 3.0 or (p_cpl < 0.001 and med_t < med_p):
                 stream_write(
