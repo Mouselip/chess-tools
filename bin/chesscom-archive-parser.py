@@ -1,7 +1,7 @@
 #!/home/tyrin/.local/share/python-global-venv/bin/python
 
 # chesscom-archive-parser.py
-# Copyright (C) 2025 Tyrin Price
+# Copyright (C) 2026 Tyrin Price
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
