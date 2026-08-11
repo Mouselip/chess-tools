@@ -54,7 +54,7 @@ import chess.engine
 import chess.pgn
 
 # Version Metadata
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 # System Configuration
 CONFIG_FILE = os.path.join(os.getcwd(), "engine_config.json")
@@ -66,9 +66,10 @@ ANALYSIS_TIME_LIMIT = 5.0     # Hard time limit per move evaluation (seconds)
 STANDARD_OPENING_BOOK_PLIES = 20  # Skip first 10 full moves for standard chess
 CHESS960_OPENING_BOOK_PLIES = 0   # No opening book skip for Chess960
 
-# ACPL Filtering Thresholds
-EVAL_CAP_CENTIPAWNS = 400     # Ignore positions evaluated beyond +/- 400 CP (4.0 pawns)
-MAX_SINGLE_MOVE_LOSS = 200    # Cap single-move loss spikes to prevent 1 blunder from ruining game ACPL
+# ACPL & Move Filtering Thresholds
+EVAL_CAP_CENTIPAWNS = 400        # Ignore positions evaluated beyond +/- 400 CP (4.0 pawns)
+MAX_SINGLE_MOVE_LOSS = 200       # Cap single-move loss spikes to prevent 1 blunder from ruining game ACPL
+T1_FORCED_GAP_CENTIPAWNS = 150   # Skip positions where T1 is > 1.5 pawns better than T2 (tactically forced choices)
 
 # Decision Volume Bounds
 TARGET_MAX_DECISIONS = 400    # Aim for up to 400 critical middlegame decisions
@@ -574,6 +575,13 @@ def analyze_game_and_harvest(game, target_user, engine, opening_plies):
             board.push(move)
             continue
 
+        # Skip positions where T1 is the only playable move (e.g., T2 is > 1.5 pawns worse)
+        if len(analysis_pv_list) >= 2:
+            cp_t2 = analysis_pv_list[1]["score"].pov(current_turn).score(mate_score=10000)
+            if (cp_before - cp_t2) > T1_FORCED_GAP_CENTIPAWNS:
+                board.push(move)
+                continue
+
         board_after = board.copy()
         board_after.push(move)
         analysis_after = engine.analyse(board_after, eval_limit)
@@ -837,7 +845,7 @@ def main():
     else:
         stream_write(f"                  Mode: Standard Pool (+/-{rating_window_val} Elo)", log_file)
     stream_write(f"                  Opening Cut <= {opening_plies//2} moves | Eval Cap <= |400| CP", log_file)
-    stream_write("                  Max Loss Bound = 200 CP", log_file)
+    stream_write(f"                  Max Loss Bound = 200 CP | Forced T1 Gap > {T1_FORCED_GAP_CENTIPAWNS} CP", log_file)
     if args.log and log_file_path:
         stream_write(f" Logging Status : Enabled -> {os.path.basename(log_file_path)}", log_file)
     else:
