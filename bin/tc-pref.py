@@ -22,8 +22,8 @@ import sys
 import urllib.error
 import urllib.request
 
-VERSION = "0.0.4"
-USER_AGENT = "tc-pref/0.0.4"
+VERSION = "0.0.5"
+USER_AGENT = "tc-pref/0.0.5"
 
 
 def parse_args():
@@ -144,6 +144,17 @@ def format_tc(tc_str):
         return tc_str
 
 
+def has_setup_tag(pgn):
+    if not pgn:
+        return False
+    for line in pgn.splitlines():
+        if line.startswith("[SetUp "):
+            return True
+        if line.startswith("1. "):
+            break
+    return False
+
+
 def main():
     args = parse_args()
     username = verify_username(args.username)
@@ -174,6 +185,8 @@ def main():
             continue
         for game in month_data.get("games", []):
             if game.get("rated") != rated_target:
+                continue
+            if has_setup_tag(game.get("pgn", "")):
                 continue
             tc = game.get("time_control")
             if tc:
