@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v1.0.1)
+# smoke-detector.py (v1.0.2)
 # Longitudinal Chess Cadence and Complexity Profiler
 #
 # Copyright (C) 2026 Tyrin R. Price
@@ -19,7 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -41,7 +41,7 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.1 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.2 (terminal-tool; python-chess)"
 MIN_BLITZ_CLOCK_RESERVE = 25.0
 
 # -----------------------------------------------------------------------------
@@ -665,6 +665,12 @@ def run_forensic_analysis(
     elif tc_category == "daily":
         print("[*] Daily/Correspondence stream detected.")
         print("[*] Bypassing clock timestamps: running pure engine fidelity and Tier-4 precision profiling.")
+
+    if tc_category != "bullet":
+        print("[*] Engine & Boundary Configuration:")
+        print(f"    - Engine: Stockfish (Depth: {depth}, MultiPV: 3, Workers: {workers}, Hash/Worker: {hash_per_worker}MB)")
+        print(f"    - Opening Book: {book_path}")
+        print("    - Endgame Trigger: <= 4 non-pawn pieces OR (no queens AND <= 6 non-pawn pieces)")
 
     if tc_category != "bullet" and not engine_path:
         print("[-] Error: Stockfish binary not found in system PATH. Specify with --engine.", file=sys.stderr)
