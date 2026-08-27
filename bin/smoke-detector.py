@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v1.0.3)
+# smoke-detector.py (v1.0.4)
 # Longitudinal Chess Cadence and Complexity Profiler
 #
 # Copyright (C) 2026 Tyrin R. Price
@@ -19,7 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -27,6 +27,7 @@ import sys
 import os
 import io
 import re
+import time
 import shutil
 import argparse
 import urllib.request
@@ -41,7 +42,7 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.3 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.4 (terminal-tool; python-chess)"
 MIN_BLITZ_CLOCK_RESERVE = 25.0
 ENGINE_TIMEOUT_SECONDS = 30.0
 
@@ -357,9 +358,10 @@ def evaluate_position(engine: chess.engine.SimpleEngine, board: chess.Board, dep
     legal_moves = list(board.legal_moves)
     num_legal = len(legal_moves)
     if num_legal == 0:
-        return {"scores": [0], "pv1": None, "num_legal": 0, "reached_depth": depth}
+        return {"scores": [0], "pv1": None, "num_legal": 0, "reached_depth": depth, "eval_time": 0.0}
 
     multipv_count = min(3, num_legal)
+    t0 = time.perf_counter()
     try:
         info = engine.analyse(
             board,
@@ -367,8 +369,10 @@ def evaluate_position(engine: chess.engine.SimpleEngine, board: chess.Board, dep
             multipv=multipv_count
         )
     except (chess.engine.EngineError, chess.engine.EngineTerminatedError, TimeoutError):
-        return {"scores": [0], "pv1": None, "num_legal": num_legal, "reached_depth": 0}
+        eval_time = time.perf_counter() - t0
+        return {"scores": [0], "pv1": None, "num_legal": num_legal, "reached_depth": 0, "eval_time": eval_time}
 
+    eval_time = time.perf_counter() - t0
     scores = []
     pv1_move = None
     reached_depth = depth
@@ -387,7 +391,13 @@ def evaluate_position(engine: chess.engine.SimpleEngine, board: chess.Board, dep
     if not scores:
         scores = [0]
 
-    return {"scores": scores, "pv1": pv1_move, "num_legal": num_legal, "reached_depth": reached_depth}
+    return {
+        "scores": scores,
+        "pv1": pv1_move,
+        "num_legal": num_legal,
+        "reached_depth": reached_depth,
+        "eval_time": eval_time
+    }
 
 # -----------------------------------------------------------------------------
 # Module 5: Workers & Stream Execution
@@ -403,7 +413,7 @@ def analyze_single_game_engine(
     engine_path: str,
     depth: int,
     hash_mb_per_worker: int
-) -> tuple[int, str, str, int, int, list[tuple[float, bool, int, int, int]]]:
+) -> tuple[int, str, str, int, int, float, float, list[tuple[float, bool, int, int, int]]]:
     reader = None
     if os.path.exists(book_path):
         try:
@@ -438,6 +448,7 @@ def analyze_single_game_engine(
     ply = 0
     results = []
     min_depth_reached = depth
+    engine_times = []
 
     while node.variations:
         next_node = node.variation(0)
@@ -462,6 +473,9 @@ def analyze_single_game_engine(
             scores = eval_res["scores"]
             pv1_move = eval_res["pv1"]
             pos_depth = eval_res["reached_depth"]
+            eval_t = eval_res["eval_time"]
+
+            engine_times.append(eval_t)
 
             if pos_depth < min_depth_reached:
                 min_depth_reached = pos_depth
@@ -495,7 +509,11 @@ def analyze_single_game_engine(
         node = next_node
 
     engine.quit()
-    return game_idx, date, opp, len(results), min_depth_reached, results
+
+    avg_engine_time = float(np.mean(engine_times)) if engine_times else 0.0
+    max_engine_time = float(np.max(engine_times)) if engine_times else 0.0
+
+    return game_idx, date, opp, len(results), min_depth_reached, avg_engine_time, max_engine_time, results
 
 def run_bullet_clock_analysis(username: str, target_tc: str, game_pgns: list[str]):
     print(f"\n[*] Step 3: Parsing clock timestamps across {len(game_pgns)} bullet games...")
@@ -674,7 +692,8 @@ def run_forensic_analysis(
     engine_path: str | None,
     workers: int,
     hash_per_worker: int,
-    depth: int
+    depth: int,
+    export_pgn_path: str | None = None
 ):
     tc_category = classify_time_control(target_tc)
 
@@ -703,6 +722,15 @@ def run_forensic_analysis(
 
     game_pgns = verify_and_fetch_games(username, target_tc, min_decisions, book_path, tc_category)
     total_games = len(game_pgns)
+
+    if export_pgn_path:
+        try:
+            with open(export_pgn_path, "w", encoding="utf-8") as f:
+                for pgn_str in game_pgns:
+                    f.write(pgn_str.strip() + "\n\n")
+            print(f"[+] Exported {total_games} target games to '{export_pgn_path}'.")
+        except OSError as e:
+            print(f"[-] Error writing PGN export to '{export_pgn_path}': {e}", file=sys.stderr)
 
     if tc_category == "bullet":
         run_bullet_clock_analysis(username, target_tc, game_pgns)
@@ -736,7 +764,7 @@ def run_forensic_analysis(
         for future in as_completed(futures):
             processed_count += 1
             try:
-                g_idx, date, opp, game_decisions, min_depth_reached, results = future.result()
+                g_idx, date, opp, game_decisions, min_depth_reached, avg_engine_t, max_engine_t, results = future.result()
                 total_decisions += game_decisions
                 all_results.extend(results)
 
@@ -745,8 +773,9 @@ def run_forensic_analysis(
                     pooled_times.append(time_spent)
                     pooled_complexity_tiers.append(c_idx + 1)
 
-                depth_str = f"[Min Depth: {min_depth_reached}]" if min_depth_reached >= depth else f"[Min Depth: {min_depth_reached} (CAPPED)]"
-                print(f"  Finished [{processed_count}/{total_games}] Game #{g_idx} ({date} vs {opp}) -> +{game_decisions} decisions (Total: {total_decisions}) {depth_str}")
+                depth_part = f"Min Depth: {min_depth_reached}" if min_depth_reached >= depth else f"Min Depth: {min_depth_reached} (CAPPED)"
+                timing_str = f"[Avg: {avg_engine_t:.2f}s/mv | Max Time: {max_engine_t:.2f}s | {depth_part}]"
+                print(f"  Finished [{processed_count}/{total_games}] Game #{g_idx} ({date} vs {opp}) -> +{game_decisions} decisions (Total: {total_decisions}) {timing_str}")
             except Exception as e:
                 print(f"  [-] Error analyzing game: {e}", file=sys.stderr)
 
@@ -775,6 +804,7 @@ if __name__ == "__main__":
     parser.add_argument("--book", default="/usr/share/scid/books/Elo2400.bin", help="Path to Polyglot .bin book")
     parser.add_argument("--engine", default=system_stockfish, help="Path to Stockfish binary")
     parser.add_argument("--depth", type=int, default=18, help="Stockfish search depth (default: 18)")
+    parser.add_argument("--export-pgn", default=None, help="Optional path to save all harvested candidate games as PGN")
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -790,5 +820,6 @@ if __name__ == "__main__":
         engine_path=args.engine,
         workers=args.workers,
         hash_per_worker=args.hash_per_worker,
-        depth=args.depth
+        depth=args.depth,
+        export_pgn_path=args.export_pgn
     )
