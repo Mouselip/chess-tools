@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v1.0.4)
+# smoke-detector.py (v1.0.5)
 # Longitudinal Chess Cadence and Complexity Profiler
 #
 # Copyright (C) 2026 Tyrin R. Price
@@ -19,7 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -42,9 +42,9 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.4 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.5 (terminal-tool; python-chess)"
 MIN_BLITZ_CLOCK_RESERVE = 25.0
-ENGINE_TIMEOUT_SECONDS = 30.0
+DEFAULT_ENGINE_TIMEOUT = 5.0
 
 # -----------------------------------------------------------------------------
 # Module 1: Time Control Categorization & HTTP Helpers
@@ -354,7 +354,7 @@ def classify_complexity(scores: list[int], num_legal_moves: int) -> int:
     else:
         return 1
 
-def evaluate_position(engine: chess.engine.SimpleEngine, board: chess.Board, depth: int, timeout: float = ENGINE_TIMEOUT_SECONDS) -> dict:
+def evaluate_position(engine: chess.engine.SimpleEngine, board: chess.Board, depth: int, timeout: float = DEFAULT_ENGINE_TIMEOUT) -> dict:
     legal_moves = list(board.legal_moves)
     num_legal = len(legal_moves)
     if num_legal == 0:
@@ -412,8 +412,9 @@ def analyze_single_game_engine(
     book_path: str,
     engine_path: str,
     depth: int,
-    hash_mb_per_worker: int
-) -> tuple[int, str, str, int, int, float, float, list[tuple[float, bool, int, int, int]]]:
+    hash_mb_per_worker: int,
+    engine_timeout: float
+) -> tuple[int, str, str, int, int, float, float, list[tuple[float, bool, int, int, int]], dict | None]:
     reader = None
     if os.path.exists(book_path):
         try:
@@ -449,6 +450,7 @@ def analyze_single_game_engine(
     results = []
     min_depth_reached = depth
     engine_times = []
+    decisions_eval_history = []
 
     while node.variations:
         next_node = node.variation(0)
@@ -469,7 +471,7 @@ def analyze_single_game_engine(
                 node = next_node
                 continue
 
-            eval_res = evaluate_position(engine, board, depth=depth, timeout=ENGINE_TIMEOUT_SECONDS)
+            eval_res = evaluate_position(engine, board, depth=depth, timeout=engine_timeout)
             scores = eval_res["scores"]
             pv1_move = eval_res["pv1"]
             pos_depth = eval_res["reached_depth"]
@@ -484,26 +486,38 @@ def analyze_single_game_engine(
             g_idx_eval = classify_game_state(scores[0])
             is_pv1 = (move == pv1_move)
 
-            cpl = 0
-            if tc_category == "daily":
-                best_score = scores[0]
-                board.push(move)
-                try:
-                    info_after = engine.analyse(
-                        board,
-                        chess.engine.Limit(depth=depth, time=ENGINE_TIMEOUT_SECONDS),
-                        multipv=1
-                    )
-                except (chess.engine.EngineError, chess.engine.EngineTerminatedError, TimeoutError):
-                    info_after = []
-                board.pop()
-                if info_after and "score" in info_after[0]:
-                    score_after_obj = info_after[0]["score"]
-                    score_after = score_after_obj.pov(turn).score(mate_score=10000)
-                    if score_after is not None:
-                        cpl = max(0, best_score - score_after)
+            best_score = scores[0]
+            board.push(move)
+            try:
+                info_after = engine.analyse(
+                    board,
+                    chess.engine.Limit(depth=depth, time=engine_timeout),
+                    multipv=1
+                )
+            except (chess.engine.EngineError, chess.engine.EngineTerminatedError, TimeoutError):
+                info_after = []
+            board.pop()
+
+            score_after = best_score
+            if info_after and "score" in info_after[0]:
+                score_after_obj = info_after[0]["score"]
+                after_val = score_after_obj.pov(turn).score(mate_score=10000)
+                if after_val is not None:
+                    score_after = after_val
+
+            cpl = max(0, best_score - score_after)
+            eval_drop = best_score - score_after
 
             results.append((time_spent, is_pv1, c_idx, g_idx_eval, cpl))
+            decisions_eval_history.append({
+                "move_num": (ply + 1) // 2,
+                "san": board.san(move),
+                "is_pv1": is_pv1,
+                "eval_drop": eval_drop,
+                "score_after": score_after,
+                "time_spent": time_spent,
+                "curr_clock": curr_clock
+            })
 
         board.push(move)
         node = next_node
@@ -513,7 +527,36 @@ def analyze_single_game_engine(
     avg_engine_time = float(np.mean(engine_times)) if engine_times else 0.0
     max_engine_time = float(np.max(engine_times)) if engine_times else 0.0
 
-    return game_idx, date, opp, len(results), min_depth_reached, avg_engine_time, max_engine_time, results
+    # -------------------------------------------------------------------------
+    # Red Flag Detector: Loss Laundering / Cliff Drop Anomaly
+    # -------------------------------------------------------------------------
+    anomaly_flag = None
+    if len(decisions_eval_history) >= 15 and tc_category != "bullet":
+        prior_decisions = decisions_eval_history[:-1]
+        prior_pv1_count = sum(1 for d in prior_decisions if d["is_pv1"])
+        prior_pv1_pct = (prior_pv1_count / len(prior_decisions)) * 100.0
+
+        final_d = decisions_eval_history[-1]
+        is_blunder_drop = final_d["eval_drop"] >= 800 or final_d["score_after"] <= -800
+        has_comfortable_clock = (final_d["curr_clock"] is not None and final_d["curr_clock"] >= 60.0) or (tc_category == "daily")
+        deliberate_time = final_d["time_spent"] >= 3.0 or tc_category == "daily"
+
+        if prior_pv1_pct >= 75.0 and is_blunder_drop and has_comfortable_clock and deliberate_time:
+            clock_repr = f"{int(final_d['curr_clock']//60)}m{int(final_d['curr_clock']%60):02d}s" if final_d["curr_clock"] is not None else "Daily"
+            anomaly_flag = {
+                "game_idx": game_idx,
+                "date": date,
+                "opp": opp,
+                "prior_pv1_pct": prior_pv1_pct,
+                "prior_moves": len(prior_decisions),
+                "blunder_move": final_d["move_num"],
+                "blunder_san": final_d["san"],
+                "eval_drop": final_d["eval_drop"],
+                "clock_left": clock_repr,
+                "think_time": final_d["time_spent"]
+            }
+
+    return game_idx, date, opp, len(results), min_depth_reached, avg_engine_time, max_engine_time, results, anomaly_flag
 
 def run_bullet_clock_analysis(username: str, target_tc: str, game_pgns: list[str]):
     print(f"\n[*] Step 3: Parsing clock timestamps across {len(game_pgns)} bullet games...")
@@ -684,6 +727,19 @@ def print_daily_report(username: str, target_tc: str, total_decisions: int, tota
     print(f"Engine Alignment Verdict:        {verdict}")
     print("=" * 80 + "\n")
 
+def print_detected_anomalies(anomalies: list[dict]):
+    if not anomalies:
+        return
+    print("\n" + "!" * 80)
+    print(f"FORENSIC ALERT: {len(anomalies)} LOSS LAUNDERING / CLIFF DROP ANOMALIES DETECTED")
+    print("!" * 80)
+    for a in anomalies:
+        print(f"  * Game #{a['game_idx']} ({a['date']} vs {a['opp']}):")
+        print(f"      - Prior Fidelity:  {a['prior_pv1_pct']:.1f}% PV1 match across {a['prior_moves']} middlegame decisions")
+        print(f"      - Terminal Move:   Move {a['blunder_move']}. {a['blunder_san']} (Eval drop: -{a['eval_drop']} cp)")
+        print(f"      - Clock at Move:   {a['clock_left']} remaining (Spent {a['think_time']:.1f}s calculating blunder)")
+    print("!" * 80 + "\n")
+
 def run_forensic_analysis(
     username: str,
     target_tc: str,
@@ -693,6 +749,7 @@ def run_forensic_analysis(
     workers: int,
     hash_per_worker: int,
     depth: int,
+    engine_timeout: float,
     export_pgn_path: str | None = None
 ):
     tc_category = classify_time_control(target_tc)
@@ -712,7 +769,7 @@ def run_forensic_analysis(
 
     if tc_category != "bullet":
         print("[*] Engine & Boundary Configuration:")
-        print(f"    - Engine: Stockfish (Depth: {depth}, MultiPV: 3, Workers: {workers}, Hash/Worker: {hash_per_worker}MB, Max Time/Move: {ENGINE_TIMEOUT_SECONDS}s)")
+        print(f"    - Engine: Stockfish (Depth: {depth}, MultiPV: 3, Workers: {workers}, Hash/Worker: {hash_per_worker}MB, Max Time/Move: {engine_timeout}s)")
         print(f"    - Opening Book: {book_path}")
         print("    - Endgame Trigger: <= 4 non-pawn pieces OR (no queens AND <= 6 non-pawn pieces)")
 
@@ -742,6 +799,7 @@ def run_forensic_analysis(
     pooled_times = []
     pooled_complexity_tiers = []
     all_results = []
+    detected_anomalies = []
     total_decisions = 0
     processed_count = 0
 
@@ -757,16 +815,20 @@ def run_forensic_analysis(
                 book_path,
                 engine_path,
                 depth,
-                hash_per_worker
+                hash_per_worker,
+                engine_timeout
             ): idx for idx, pgn in enumerate(game_pgns, 1)
         }
 
         for future in as_completed(futures):
             processed_count += 1
             try:
-                g_idx, date, opp, game_decisions, min_depth_reached, avg_engine_t, max_engine_t, results = future.result()
+                g_idx, date, opp, game_decisions, min_depth_reached, avg_engine_t, max_engine_t, results, anomaly = future.result()
                 total_decisions += game_decisions
                 all_results.extend(results)
+
+                if anomaly:
+                    detected_anomalies.append(anomaly)
 
                 for time_spent, is_pv1, c_idx, g_idx_eval, _ in results:
                     matrix[g_idx_eval][c_idx].append((time_spent, is_pv1))
@@ -775,7 +837,8 @@ def run_forensic_analysis(
 
                 depth_part = f"Min Depth: {min_depth_reached}" if min_depth_reached >= depth else f"Min Depth: {min_depth_reached} (CAPPED)"
                 timing_str = f"[Avg: {avg_engine_t:.2f}s/mv | Max Time: {max_engine_t:.2f}s | {depth_part}]"
-                print(f"  Finished [{processed_count}/{total_games}] Game #{g_idx} ({date} vs {opp}) -> +{game_decisions} decisions (Total: {total_decisions}) {timing_str}")
+                flag_str = " [FLAG: LOSS_LAUNDERING_ANOMALY]" if anomaly else ""
+                print(f"  Finished [{processed_count}/{total_games}] Game #{g_idx} ({date} vs {opp}) -> +{game_decisions} decisions (Total: {total_decisions}) {timing_str}{flag_str}")
             except Exception as e:
                 print(f"  [-] Error analyzing game: {e}", file=sys.stderr)
 
@@ -783,6 +846,8 @@ def run_forensic_analysis(
         print_daily_report(username, target_tc, total_decisions, total_games, all_results)
     else:
         print_behavioral_matrix_report(username, target_tc, total_decisions, total_games, matrix, pooled_times, pooled_complexity_tiers)
+
+    print_detected_anomalies(detected_anomalies)
 
 # -----------------------------------------------------------------------------
 # CLI Entry Point
@@ -804,6 +869,7 @@ if __name__ == "__main__":
     parser.add_argument("--book", default="/usr/share/scid/books/Elo2400.bin", help="Path to Polyglot .bin book")
     parser.add_argument("--engine", default=system_stockfish, help="Path to Stockfish binary")
     parser.add_argument("--depth", type=int, default=18, help="Stockfish search depth (default: 18)")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_ENGINE_TIMEOUT, help=f"Max engine calculation ceiling per move in seconds (default: {DEFAULT_ENGINE_TIMEOUT})")
     parser.add_argument("--export-pgn", default=None, help="Optional path to save all harvested candidate games as PGN")
 
     if len(sys.argv) == 1:
@@ -821,5 +887,6 @@ if __name__ == "__main__":
         workers=args.workers,
         hash_per_worker=args.hash_per_worker,
         depth=args.depth,
+        engine_timeout=args.timeout,
         export_pgn_path=args.export_pgn
     )
