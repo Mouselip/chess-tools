@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v1.0.11)
+# smoke-detector.py (v1.0.12)
 # Longitudinal Chess Cadence and Complexity Profiler
 #
 # Copyright (C) 2026 Tyrin R. Price
@@ -19,7 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "1.0.11"
+__version__ = "1.0.12"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -42,7 +42,7 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.11 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.12 (terminal-tool; python-chess)"
 DEFAULT_ENGINE_TIMEOUT = 8.0
 
 # -----------------------------------------------------------------------------
@@ -169,7 +169,8 @@ def verify_and_fetch_games(
     target_tc: str,
     min_decisions: int,
     book_path: str,
-    tc_category: str
+    tc_category: str,
+    allow_unrated: bool = False
 ) -> list[str]:
     print(f"[*] Step 1: Verifying Chess.com account for '{username}'...")
     profile_url = f"https://api.chess.com/pub/player/{username}"
@@ -225,6 +226,17 @@ def verify_and_fetch_games(
 
         for game in reversed(month_games):
             headers = game.headers
+
+            # Exclude ANY custom setup games
+            if headers.get("SetUp") == "1" or "FEN" in headers:
+                continue
+
+            # Rated game filter
+            if not allow_unrated:
+                rated_val = headers.get("Rated", "").lower()
+                if rated_val not in ["true", "1"]:
+                    continue
+
             tc = headers.get("TimeControl", "")
             if tc != target_tc:
                 continue
@@ -365,6 +377,9 @@ def safe_analyse_position(
     engine_path: str,
     hash_mb: int
 ) -> tuple[chess.engine.SimpleEngine, list, float]:
+    if board.is_game_over() or not list(board.legal_moves):
+        return engine, [], 0.0
+
     t0 = time.perf_counter()
     try:
         info = engine.analyse(
@@ -374,7 +389,12 @@ def safe_analyse_position(
         )
         eval_time = time.perf_counter() - t0
         return engine, info, eval_time
-    except (chess.engine.EngineError, chess.engine.EngineTerminatedError, TimeoutError, Exception):
+    except Exception:
+        try:
+            if hasattr(engine, "transport") and engine.transport:
+                engine.transport.kill()
+        except Exception:
+            pass
         try:
             engine.close()
         except Exception:
@@ -393,7 +413,7 @@ def evaluate_position(
 ) -> tuple[chess.engine.SimpleEngine, dict]:
     legal_moves = list(board.legal_moves)
     num_legal = len(legal_moves)
-    if num_legal == 0:
+    if num_legal == 0 or board.is_game_over():
         return engine, {"scores": [0], "pv1": None, "num_legal": 0, "reached_depth": depth, "eval_time": 0.0}
 
     multipv_count = min(3, num_legal)
@@ -509,18 +529,24 @@ def analyze_single_game_engine(
             best_white_score = white_scores[0]
             board.push(move)
 
-            engine, info_after, _ = safe_analyse_position(
-                engine, board, multipv=1, depth=depth, timeout=engine_timeout,
-                engine_path=engine_path, hash_mb=hash_mb_per_worker
-            )
-            board.pop()
+            if board.is_game_over():
+                if board.is_checkmate():
+                    after_white_score = 10000 if turn == chess.WHITE else -10000
+                else:
+                    after_white_score = 0
+            else:
+                engine, info_after, _ = safe_analyse_position(
+                    engine, board, multipv=1, depth=depth, timeout=engine_timeout,
+                    engine_path=engine_path, hash_mb=hash_mb_per_worker
+                )
+                after_white_score = best_white_score
+                if info_after and "score" in info_after[0]:
+                    score_after_obj = info_after[0]["score"]
+                    after_val = score_after_obj.white().score(mate_score=10000)
+                    if after_val is not None:
+                        after_white_score = after_val
 
-            after_white_score = best_white_score
-            if info_after and "score" in info_after[0]:
-                score_after_obj = info_after[0]["score"]
-                after_val = score_after_obj.white().score(mate_score=10000)
-                if after_val is not None:
-                    after_white_score = after_val
+            board.pop()
 
             if turn == chess.WHITE:
                 eval_drop = best_white_score - after_white_score
@@ -817,6 +843,7 @@ def run_forensic_analysis(
     hash_per_worker: int,
     depth: int,
     engine_timeout: float,
+    allow_unrated: bool = False,
     export_pgn_path: str | None = None
 ):
     tc_category = classify_time_control(target_tc)
@@ -844,7 +871,7 @@ def run_forensic_analysis(
         print("[-] Error: Stockfish binary not found in system PATH. Specify with --engine.", file=sys.stderr)
         sys.exit(1)
 
-    game_pgns = verify_and_fetch_games(username, target_tc, min_decisions, book_path, tc_category)
+    game_pgns = verify_and_fetch_games(username, target_tc, min_decisions, book_path, tc_category, allow_unrated)
     total_games = len(game_pgns)
 
     if export_pgn_path:
@@ -930,6 +957,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("player", help="Target Chess.com username")
     parser.add_argument("tc", help="Exact TimeControl (e.g., 900+10, 600, 180+2, 60, 1/86400)")
+    parser.add_argument("-u", "--unrated", action="store_true", help="Include unrated/casual games (default: rated only)")
     parser.add_argument("--min-decisions", type=int, default=500, help="Target middlegame decision count (default: 500)")
     parser.add_argument("--workers", type=int, default=default_workers, help=f"Parallel worker processes (default: {default_workers})")
     parser.add_argument("--hash-per-worker", type=int, default=1024, help="Stockfish hash table per worker in MB (default: 1024)")
@@ -955,5 +983,6 @@ if __name__ == "__main__":
         hash_per_worker=args.hash_per_worker,
         depth=args.depth,
         engine_timeout=args.timeout,
+        allow_unrated=args.unrated,
         export_pgn_path=args.export_pgn
     )
