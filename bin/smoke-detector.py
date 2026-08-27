@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v1.0.9)
+# smoke-detector.py (v1.0.10)
 # Longitudinal Chess Cadence and Complexity Profiler
 #
 # Copyright (C) 2026 Tyrin R. Price
@@ -19,7 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "1.0.9"
+__version__ = "1.0.10"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -42,7 +42,7 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.9 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.10 (terminal-tool; python-chess)"
 MIN_BLITZ_CLOCK_RESERVE = 25.0
 DEFAULT_ENGINE_TIMEOUT = 8.0
 
@@ -659,7 +659,7 @@ def run_bullet_clock_analysis(username: str, target_tc: str, game_pgns: list[str
 # Module 6: Output Reports & Dispatcher
 # -----------------------------------------------------------------------------
 
-def print_behavioral_matrix_report(username: str, target_tc: str, total_decisions: int, total_games: int, matrix: list, pooled_times: list, pooled_tiers: list):
+def print_behavioral_matrix_report(username: str, target_tc: str, total_decisions: int, total_games: int, matrix: list, pooled_times: list, pooled_tiers: list, all_results: list):
     print("\n" + "=" * 135)
     print(f"BEHAVIORAL MATRIX (Game State vs. Complexity) for '{username}'")
     print(f"Sample: {total_decisions} decisions across {total_games} games | TC: {target_tc}")
@@ -692,25 +692,55 @@ def print_behavioral_matrix_report(username: str, target_tc: str, total_decision
         median_time = np.median(pooled_times)
         std_time = np.std(pooled_times)
 
+        tier4_moves = [r for r in all_results if r[2] == 3]
+        tier4_count = len(tier4_moves)
+        tier4_matches = sum(1 for r in tier4_moves if r[1])
+        tier4_pct = (tier4_matches / tier4_count * 100) if tier4_count > 0 else 0.0
+
+        pv1_total_matches = sum(1 for r in all_results if r[1])
+        pv1_total_pct = (pv1_total_matches / total_decisions * 100) if total_decisions > 0 else 0.0
+
+        if corr >= 0.35:
+            cadence_desc = "Normal Cognitive Scaling"
+        elif 0.15 <= corr < 0.35:
+            cadence_desc = "Moderate Cadence Scaling"
+        elif -0.10 <= corr < 0.15:
+            cadence_desc = "Flat / Decoupled"
+        else:
+            cadence_desc = "Inverted Pacing"
+
         print("\nDIAGNOSTIC SUMMARY & TIMING PROFILE:")
         print("-" * 60)
         print(f"Total Middlegame Decisions: {total_decisions}")
         print(f"Mean Think Time:            {mean_time:.2f}s (Std: {std_time:.2f}s, Median: {median_time:.2f}s)")
         print(f"Spearman Rank Corr (ρ):     {corr:.4f} (p-value: {p_val:.4e})")
+        print(f"Cadence Profile:            {cadence_desc}")
+        print("-" * 60)
 
         if total_decisions < 100 or p_val >= 0.05:
-            verdict = "[INCONCLUSIVE] Insufficient decision volume or high p-value variance"
+            final_verdict = "[INCONCLUSIVE] Insufficient decision volume or high p-value variance"
+        elif corr < 0.15 and tier4_pct >= 65.0:
+            final_verdict = "[SUSPICIOUS] High engine fidelity on complex nodes with decoupled cadence"
+        elif tier4_pct >= 75.0:
+            final_verdict = "[SUSPICIOUS] Super-GM/Engine precision on sharp Tier 4 branches"
+        elif corr < 0.15 and tier4_pct < 45.0:
+            final_verdict = "[CLEAN] Intuitive human play (Flat timing with degraded complex precision)"
         elif corr >= 0.35:
-            verdict = "[CLEAN] Normal human variance (Higher complexity -> deeper calculation)"
-        elif 0.15 <= corr < 0.35:
-            verdict = "[BORDERLINE] Moderate / mild cadence scaling"
-        elif -0.10 <= corr < 0.15:
-            verdict = "[SUSPICIOUS] Flat / decoupled timing (Lack of cognitive scaling across difficulty tiers)"
+            final_verdict = "[CLEAN] Authentic human cognitive scaling"
+        elif 0.15 <= corr < 0.35 and tier4_pct < 55.0:
+            final_verdict = "[CLEAN] Standard human pacing and resolution profile"
         else:
-            verdict = "[SUSPICIOUS] Inverted cadence anomaly (Faster on sharp nodes than trivial ones)"
+            final_verdict = "[BORDERLINE] Intermediate precision / cadence alignment"
 
-        print(f"Aggregate Pacing Verdict:   {verdict}")
-        print("=" * 60 + "\n")
+        print("\n" + "=" * 135)
+        print("FINAL FORENSIC VERDICT:")
+        print("-" * 135)
+        print(f"  * Cadence Scaling:         {cadence_desc} (ρ: {corr:.4f}, p: {p_val:.4e})")
+        print(f"  * Tier 4 Engine Accuracy:  {tier4_pct:.1f}% ({tier4_matches}/{tier4_count} matches on sharp nodes)")
+        print(f"  * Overall Engine Match:    {pv1_total_pct:.1f}% ({pv1_total_matches}/{total_decisions})")
+        print("-" * 135)
+        print(f"  >> OVERALL VERDICT:        {final_verdict}")
+        print("=" * 135 + "\n")
 
 def print_daily_report(username: str, target_tc: str, total_decisions: int, total_games: int, all_results: list):
     pv1_matches = sum(1 for r in all_results if r[1])
@@ -864,7 +894,7 @@ def run_forensic_analysis(
     if tc_category == "daily":
         print_daily_report(username, target_tc, total_decisions, total_games, all_results)
     else:
-        print_behavioral_matrix_report(username, target_tc, total_decisions, total_games, matrix, pooled_times, pooled_complexity_tiers)
+        print_behavioral_matrix_report(username, target_tc, total_decisions, total_games, matrix, pooled_times, pooled_complexity_tiers, all_results)
 
     print_detected_anomalies(detected_anomalies)
 
