@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
-"""
-smoke-detector.py (v1.0.0)
-Chess.com Forensic Middlegame & Cadence Profiler
+# -*- coding: utf-8 -*-
+#
+# smoke-detector.py (v1.0.1)
+# Longitudinal Chess Cadence and Complexity Profiler
+#
+# Copyright (C) 2026 Tyrin R. Price
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-Features:
-- Pre-flight account validation and monthly archive streaming via PubAPI
-- Polyglot opening book cutoff (Elo2400.bin)
-- Disjunctive endgame transition detection:
-    Pieces <= 4 OR (No Queens AND Pieces <= 6)
-- Multi-threaded Stockfish MultiPV=3 search strictly on middlegame decisions
-- Pure Structural Complexity scale (Trivial -> Simple -> Complex -> Highly Complex)
-- Full 7-tier Game State classification
-- Behavioral Matrix mapping (Game State x Complexity) with Spearman Rank diagnostics
-"""
-
-__version__ = "1.0.0"
+__version__ = "1.0.1"
+__author__ = "Tyrin R. Price"
+__license__ = "GPL-3.0-or-later"
 
 import sys
 import os
@@ -25,6 +32,8 @@ import argparse
 import urllib.request
 import urllib.error
 import json
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import chess
 import chess.pgn
@@ -32,11 +41,39 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.0 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.1 (terminal-tool; python-chess)"
+MIN_BLITZ_CLOCK_RESERVE = 25.0
 
 # -----------------------------------------------------------------------------
-# Module 1: Pre-flight Verification & PubAPI Streaming
+# Module 1: Time Control Categorization & HTTP Helpers
 # -----------------------------------------------------------------------------
+
+def parse_time_control(tc_header: str) -> tuple[float, float]:
+    if not tc_header or tc_header == "?":
+        return 0.0, 0.0
+    parts = tc_header.split("+")
+    base = float(parts[0]) if parts[0].isdigit() else 0.0
+    inc = float(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0.0
+    return base, inc
+
+def classify_time_control(tc_str: str) -> str:
+    if not tc_str or tc_str == "?":
+        return "unknown"
+    if tc_str.startswith("1/") or "/" in tc_str:
+        return "daily"
+    parts = tc_str.split("+")
+    try:
+        base = float(parts[0])
+        inc = float(parts[1]) if len(parts) > 1 else 0.0
+    except ValueError:
+        return "unknown"
+    effective_seconds = base + (40.0 * inc)
+    if effective_seconds < 180.0:
+        return "bullet"
+    elif effective_seconds < 480.0:
+        return "blitz"
+    else:
+        return "rapid_classical"
 
 def fetch_json(url: str) -> dict | list | None:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -61,36 +98,112 @@ def fetch_text(url: str) -> str | None:
         print(f"Error fetching PGN data from {url}: {e}", file=sys.stderr)
         return None
 
+# -----------------------------------------------------------------------------
+# Module 2: Clock & Phase Boundaries
+# -----------------------------------------------------------------------------
+
+def parse_clock(comment: str) -> float | None:
+    match = re.search(r'\[%clk\s+(\d+):(\d+):([\d\.]+)\]', comment)
+    if not match:
+        return None
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+def count_non_pawn_pieces(board: chess.Board) -> tuple[int, int, int]:
+    wq = len(board.pieces(chess.QUEEN, chess.WHITE))
+    bq = len(board.pieces(chess.QUEEN, chess.BLACK))
+    total_pieces = sum(
+        len(board.pieces(pt, chess.WHITE)) + len(board.pieces(pt, chess.BLACK))
+        for pt in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
+    )
+    return wq, bq, total_pieces
+
+def is_endgame_state(board: chess.Board) -> bool:
+    wq, bq, pieces = count_non_pawn_pieces(board)
+    no_queens = (wq == 0 and bq == 0)
+    return pieces <= 4 or (no_queens and pieces <= 6)
+
+def get_phase_boundaries(game: chess.pgn.Game, reader: chess.polyglot.MemoryMappedReader | None) -> tuple[int, int]:
+    board = game.board()
+    node = game
+    ply = 0
+    in_book = True
+    opening_end_ply = None
+    endgame_start_ply = None
+
+    while node.variations:
+        next_node = node.variation(0)
+        move = next_node.move
+        ply += 1
+
+        if in_book and reader is not None:
+            try:
+                book_moves = [entry.move for entry in reader.find_all(board)]
+                if not book_moves or move not in book_moves:
+                    in_book = False
+                    opening_end_ply = ply
+            except Exception:
+                in_book = False
+                opening_end_ply = ply
+        elif in_book and reader is None:
+            in_book = False
+            opening_end_ply = 1
+
+        board.push(move)
+        node = next_node
+
+        if endgame_start_ply is None and is_endgame_state(board):
+            endgame_start_ply = ply
+
+    mg_start = opening_end_ply if opening_end_ply is not None else 1
+    mg_end = (endgame_start_ply - 1) if endgame_start_ply is not None else ply
+    return mg_start, mg_end
+
+# -----------------------------------------------------------------------------
+# Module 3: Pre-flight Verification & Archive Harvester
+# -----------------------------------------------------------------------------
+
 def verify_and_fetch_games(
     username: str,
     target_tc: str,
     min_decisions: int,
-    reader: chess.polyglot.MemoryMappedReader
-) -> list[tuple[chess.pgn.Game, int, int]]:
+    book_path: str,
+    tc_category: str
+) -> list[str]:
     print(f"[*] Step 1: Verifying Chess.com account for '{username}'...")
     profile_url = f"https://api.chess.com/pub/player/{username}"
     profile = fetch_json(profile_url)
-    
+
     if profile is None:
         print(f"[-] Error: Player '{username}' not found on Chess.com (404).", file=sys.stderr)
         sys.exit(1)
-    
+
     status = profile.get("status", "unknown")
     print(f"[+] Account verified: {profile.get('username', username)} (Status: {status})")
+
+    reader = None
+    if tc_category != "bullet":
+        try:
+            reader = chess.polyglot.open_reader(book_path)
+        except FileNotFoundError:
+            print(f"[-] Error: Opening book not found at '{book_path}'", file=sys.stderr)
+            sys.exit(1)
 
     print(f"[*] Step 2: Querying game archives...")
     archives_url = f"https://api.chess.com/pub/player/{username}/games/archives"
     archives_data = fetch_json(archives_url)
-    
+
     if not archives_data or "archives" not in archives_data or not archives_data["archives"]:
         print(f"[-] Error: No game archives found for '{username}'.", file=sys.stderr)
+        if reader is not None:
+            reader.close()
         sys.exit(1)
 
     archive_urls = archives_data["archives"]
-    archive_urls.reverse()  # Inspect most recent months first
+    archive_urls.reverse()
     print(f"[+] Found {len(archive_urls)} monthly archives. Scanning backwards for TC '{target_tc}'...")
 
-    selected_games = []
+    selected_game_pgns = []
     accumulated_decisions = 0
 
     for arch_url in archive_urls:
@@ -124,106 +237,69 @@ def verify_and_fetch_games(
                 continue
 
             target_color = chess.WHITE if is_white else chess.BLACK
-            mg_start, mg_end = get_phase_boundaries(game, reader)
-            if mg_start > mg_end:
-                continue
 
-            player_mg_moves = 0
-            board = game.board()
-            node = game
-            ply = 0
-            while node.variations:
-                next_node = node.variation(0)
-                turn = board.turn
-                ply += 1
-                if mg_start <= ply <= mg_end and turn == target_color:
-                    player_mg_moves += 1
-                board.push(next_node.move)
-                node = next_node
+            if tc_category == "bullet":
+                player_moves = 0
+                board = game.board()
+                node = game
+                while node.variations:
+                    next_node = node.variation(0)
+                    turn = board.turn
+                    if turn == target_color:
+                        player_moves += 1
+                    board.push(next_node.move)
+                    node = next_node
 
-            if player_mg_moves >= 3:
-                selected_games.append((game, mg_start, mg_end))
-                accumulated_decisions += player_mg_moves
+                if player_moves >= 5:
+                    exporter = chess.pgn.StringExporter(headers=True, variations=True, comments=True)
+                    selected_game_pgns.append(game.accept(exporter))
+                    accumulated_decisions += player_moves
+            else:
+                mg_start, mg_end = get_phase_boundaries(game, reader)
+                if mg_start > mg_end:
+                    continue
+
+                player_mg_moves = 0
+                board = game.board()
+                node = game
+                ply = 0
+                while node.variations:
+                    next_node = node.variation(0)
+                    turn = board.turn
+                    ply += 1
+                    if mg_start <= ply <= mg_end and turn == target_color:
+                        if tc_category == "blitz":
+                            clk = parse_clock(next_node.comment)
+                            if clk is not None and clk < MIN_BLITZ_CLOCK_RESERVE:
+                                board.push(next_node.move)
+                                node = next_node
+                                continue
+                        player_mg_moves += 1
+                    board.push(next_node.move)
+                    node = next_node
+
+                if player_mg_moves >= 3:
+                    exporter = chess.pgn.StringExporter(headers=True, variations=True, comments=True)
+                    selected_game_pgns.append(game.accept(exporter))
+                    accumulated_decisions += player_mg_moves
 
             if accumulated_decisions >= min_decisions:
-                print(f"[+] Target decision threshold reached ({accumulated_decisions} >= {min_decisions}) across {len(selected_games)} games.")
-                return selected_games
+                if reader is not None:
+                    reader.close()
+                print(f"[+] Target decision threshold reached ({accumulated_decisions} >= {min_decisions}) across {len(selected_game_pgns)} games.")
+                return selected_game_pgns
 
-    print(f"[!] Reached end of available archives. Found {accumulated_decisions} decisions across {len(selected_games)} games.")
+    if reader is not None:
+        reader.close()
+    print(f"[!] Reached end of available archives. Found {accumulated_decisions} decisions across {len(selected_game_pgns)} games.")
     if accumulated_decisions == 0:
-        print(f"[-] Error: No valid middlegame decisions found for '{username}' in time control '{target_tc}'.", file=sys.stderr)
+        print(f"[-] Error: No valid decisions found for '{username}' in time control '{target_tc}'.", file=sys.stderr)
         sys.exit(1)
 
-    return selected_games
+    return selected_game_pgns
 
 # -----------------------------------------------------------------------------
-# Module 2: Clock & Phase Boundaries
-# -----------------------------------------------------------------------------
-
-def parse_clock(comment: str) -> float | None:
-    match = re.search(r'\[%clk\s+(\d+):(\d+):([\d\.]+)\]', comment)
-    if not match:
-        return None
-    hours, minutes, seconds = match.groups()
-    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-
-def parse_time_control(tc_header: str) -> tuple[float, float]:
-    if not tc_header or tc_header == "?":
-        return 0.0, 0.0
-    parts = tc_header.split("+")
-    base = float(parts[0]) if parts[0].isdigit() else 0.0
-    inc = float(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0.0
-    return base, inc
-
-def count_non_pawn_pieces(board: chess.Board) -> tuple[int, int, int]:
-    wq = len(board.pieces(chess.QUEEN, chess.WHITE))
-    bq = len(board.pieces(chess.QUEEN, chess.BLACK))
-    total_pieces = sum(
-        len(board.pieces(pt, chess.WHITE)) + len(board.pieces(pt, chess.BLACK))
-        for pt in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
-    )
-    return wq, bq, total_pieces
-
-def is_endgame_state(board: chess.Board) -> bool:
-    wq, bq, pieces = count_non_pawn_pieces(board)
-    no_queens = (wq == 0 and bq == 0)
-    return pieces <= 4 or (no_queens and pieces <= 6)
-
-def get_phase_boundaries(game: chess.pgn.Game, reader: chess.polyglot.MemoryMappedReader) -> tuple[int, int]:
-    board = game.board()
-    node = game
-    ply = 0
-    in_book = True
-    opening_end_ply = None
-    endgame_start_ply = None
-
-    while node.variations:
-        next_node = node.variation(0)
-        move = next_node.move
-        ply += 1
-
-        if in_book:
-            try:
-                book_moves = [entry.move for entry in reader.find_all(board)]
-                if not book_moves or move not in book_moves:
-                    in_book = False
-                    opening_end_ply = ply
-            except Exception:
-                in_book = False
-                opening_end_ply = ply
-
-        board.push(move)
-        node = next_node
-
-        if endgame_start_ply is None and is_endgame_state(board):
-            endgame_start_ply = ply
-
-    mg_start = opening_end_ply if opening_end_ply is not None else 1
-    mg_end = (endgame_start_ply - 1) if endgame_start_ply is not None else ply
-    return mg_start, mg_end
-
-# -----------------------------------------------------------------------------
-# Module 3: Position Evaluation & Categorization
+# Module 4: Engine Evaluation & Categorization
 # -----------------------------------------------------------------------------
 
 GAME_STATES = [
@@ -261,21 +337,20 @@ def classify_game_state(score_cp: int) -> int:
 
 def classify_complexity(scores: list[int], num_legal_moves: int) -> int:
     if num_legal_moves <= 1 or len(scores) < 2:
-        return 0  # Tier 1: Trivial
-
+        return 0
     d12 = abs(scores[0] - scores[1])
     d13 = abs(scores[0] - scores[2]) if len(scores) > 2 else d12
 
     if d12 >= 300:
-        return 0  # Tier 1: Trivial
+        return 0
     elif 100 <= d12 < 300:
-        return 1  # Tier 2: Simple
+        return 1
     elif d12 < 50 and d13 < 100:
-        return 3  # Tier 4: Highly Complex
+        return 3
     elif d12 < 100:
-        return 2  # Tier 3: Complex
+        return 2
     else:
-        return 1  # Tier 2: Simple
+        return 1
 
 def evaluate_position(engine: chess.engine.SimpleEngine, board: chess.Board, depth: int) -> dict:
     legal_moves = list(board.legal_moves)
@@ -302,109 +377,187 @@ def evaluate_position(engine: chess.engine.SimpleEngine, board: chess.Board, dep
     return {"scores": scores, "pv1": pv1_move, "num_legal": num_legal}
 
 # -----------------------------------------------------------------------------
-# Module 4: Engine Execution & Matrix Reporting
+# Module 5: Workers & Stream Execution
 # -----------------------------------------------------------------------------
 
-def run_forensic_analysis(
+def analyze_single_game_engine(
+    game_idx: int,
+    pgn_str: str,
     username: str,
     target_tc: str,
-    min_decisions: int,
+    tc_category: str,
     book_path: str,
-    engine_path: str | None,
-    threads: int,
-    hash_mb: int,
-    depth: int
-):
-    if not engine_path:
-        print("Error: Stockfish binary not found in system PATH. Specify with --engine.", file=sys.stderr)
-        sys.exit(1)
+    engine_path: str,
+    depth: int,
+    hash_mb_per_worker: int
+) -> tuple[int, str, str, int, list[tuple[float, bool, int, int, int]]]:
+    reader = None
+    if os.path.exists(book_path):
+        try:
+            reader = chess.polyglot.open_reader(book_path)
+        except Exception:
+            reader = None
 
-    try:
-        reader = chess.polyglot.open_reader(book_path)
-    except FileNotFoundError:
-        print(f"Error: Opening book not found at '{book_path}'", file=sys.stderr)
-        sys.exit(1)
+    engine = chess.engine.SimpleEngine.popen_uci(engine_path)
+    engine.configure({
+        "Threads": 1,
+        "Hash": hash_mb_per_worker
+    })
 
-    games_to_analyze = verify_and_fetch_games(username, target_tc, min_decisions, reader)
+    game = chess.pgn.read_game(io.StringIO(pgn_str))
+    headers = game.headers
+    white = headers.get("White", "")
+    black = headers.get("Black", "")
+    is_white = white.lower() == username.lower()
+    target_color = chess.WHITE if is_white else chess.BLACK
+    opp = black if is_white else white
+    date = headers.get("Date", "????.??.??")
 
-    try:
-        engine = chess.engine.SimpleEngine.popen_uci(engine_path)
-        engine.configure({
-            "Threads": threads,
-            "Hash": hash_mb
-        })
-    except Exception as e:
-        print(f"Error initializing engine at '{engine_path}': {e}", file=sys.stderr)
+    mg_start, mg_end = get_phase_boundaries(game, reader)
+    if reader is not None:
         reader.close()
-        sys.exit(1)
-
-    print(f"\n[*] Step 3: Running Stockfish ({threads} threads, {hash_mb}MB hash, Depth: {depth}) on {len(games_to_analyze)} game middlegames...")
-
-    matrix = [[[] for _ in range(4)] for _ in range(7)]
-    pooled_times = []
-    pooled_complexity_tiers = []
-    total_decisions = 0
 
     base_sec, inc_sec = parse_time_control(target_tc)
+    prev_clocks = {chess.WHITE: base_sec, chess.BLACK: base_sec}
 
-    for g_idx, (game, mg_start, mg_end) in enumerate(games_to_analyze, 1):
+    board = game.board()
+    node = game
+    ply = 0
+    results = []
+
+    while node.variations:
+        next_node = node.variation(0)
+        move = next_node.move
+        turn = board.turn
+        ply += 1
+
+        curr_clock = parse_clock(next_node.comment) if tc_category != "daily" else None
+        time_spent = 0.0
+        if curr_clock is not None:
+            if prev_clocks[turn] is not None:
+                time_spent = max(0.1, round(prev_clocks[turn] - curr_clock + inc_sec, 2))
+            prev_clocks[turn] = curr_clock
+
+        if mg_start <= ply <= mg_end and turn == target_color:
+            if tc_category == "blitz" and curr_clock is not None and curr_clock < MIN_BLITZ_CLOCK_RESERVE:
+                board.push(move)
+                node = next_node
+                continue
+
+            eval_res = evaluate_position(engine, board, depth=depth)
+            scores = eval_res["scores"]
+            pv1_move = eval_res["pv1"]
+
+            c_idx = classify_complexity(scores, eval_res["num_legal"])
+            g_idx_eval = classify_game_state(scores[0])
+            is_pv1 = (move == pv1_move)
+
+            cpl = 0
+            if tc_category == "daily":
+                best_score = scores[0]
+                board.push(move)
+                info_after = engine.analyse(board, chess.engine.Limit(depth=depth), multipv=1)
+                board.pop()
+                if info_after and "score" in info_after[0]:
+                    score_after_obj = info_after[0]["score"]
+                    score_after = score_after_obj.pov(turn).score(mate_score=10000)
+                    if score_after is not None:
+                        cpl = max(0, best_score - score_after)
+
+            results.append((time_spent, is_pv1, c_idx, g_idx_eval, cpl))
+
+        board.push(move)
+        node = next_node
+
+    engine.quit()
+    return game_idx, date, opp, len(results), results
+
+def run_bullet_clock_analysis(username: str, target_tc: str, game_pgns: list[str]):
+    print(f"\n[*] Step 3: Parsing clock timestamps across {len(game_pgns)} bullet games...")
+    base_sec, inc_sec = parse_time_control(target_tc)
+    all_move_times = []
+    game_move_counts = []
+
+    for pgn_str in game_pgns:
+        game = chess.pgn.read_game(io.StringIO(pgn_str))
         headers = game.headers
         white = headers.get("White", "")
         black = headers.get("Black", "")
         is_white = white.lower() == username.lower()
         target_color = chess.WHITE if is_white else chess.BLACK
-        opp = black if is_white else white
-        date = headers.get("Date", "????.??.??")
 
         board = game.board()
         node = game
-        ply = 0
         prev_clocks = {chess.WHITE: base_sec, chess.BLACK: base_sec}
-        game_decisions = 0
+        this_game_times = []
 
         while node.variations:
             next_node = node.variation(0)
             move = next_node.move
             turn = board.turn
-            ply += 1
 
             curr_clock = parse_clock(next_node.comment)
-            time_spent = 0.0
             if curr_clock is not None:
                 if prev_clocks[turn] is not None:
-                    time_spent = max(0.1, round(prev_clocks[turn] - curr_clock + inc_sec, 2))
+                    time_spent = max(0.01, round(prev_clocks[turn] - curr_clock + inc_sec, 2))
+                    if turn == target_color:
+                        this_game_times.append(time_spent)
                 prev_clocks[turn] = curr_clock
-
-            if mg_start <= ply <= mg_end and turn == target_color:
-                eval_res = evaluate_position(engine, board, depth=depth)
-                scores = eval_res["scores"]
-                pv1_move = eval_res["pv1"]
-
-                c_idx = classify_complexity(scores, eval_res["num_legal"])
-                g_idx_eval = classify_game_state(scores[0])
-                is_pv1 = (move == pv1_move)
-
-                matrix[g_idx_eval][c_idx].append((time_spent, is_pv1))
-                pooled_times.append(time_spent)
-                pooled_complexity_tiers.append(c_idx + 1)
-
-                game_decisions += 1
-                total_decisions += 1
 
             board.push(move)
             node = next_node
 
-        print(f"  Processed [{g_idx}/{len(games_to_analyze)}] {date} vs {opp} (+{game_decisions} decisions | Total: {total_decisions})")
+        if this_game_times:
+            all_move_times.extend(this_game_times)
+            game_move_counts.append(len(this_game_times))
 
-    reader.close()
-    engine.quit()
+    total_moves = len(all_move_times)
+    times_arr = np.array(all_move_times)
 
-    # -----------------------------------------------------------------------------
-    # Module 5: Output Report
-    # -----------------------------------------------------------------------------
+    mean_t = float(np.mean(times_arr))
+    std_t = float(np.std(times_arr))
+    median_t = float(np.median(times_arr))
+    cv = std_t / mean_t if mean_t > 0 else 0.0
+
+    if len(times_arr) > 1:
+        lag1_r = float(np.corrcoef(times_arr[:-1], times_arr[1:])[0, 1])
+    else:
+        lag1_r = 0.0
+
+    sub_half_sec = float(np.sum(times_arr < 0.5) / total_moves * 100)
+    premoves = float(np.sum(times_arr <= 0.15) / total_moves * 100)
+
+    print("\n" + "=" * 80)
+    print(f"BULLET CADENCE & CLOCK PROFILE for '{username}'")
+    print(f"Sample: {total_moves} moves across {len(game_pgns)} games | TC: {target_tc}")
+    print("=" * 80)
+    print(f"Mean Move Time:              {mean_t:.2f}s (Std: {std_t:.2f}s, Median: {median_t:.2f}s)")
+    print(f"Coefficient of Variation (CV): {cv:.4f}")
+    print(f"Lag-1 Autocorrelation (r):     {lag1_r:.4f}")
+    print(f"Sub-0.5s Move Rate:          {sub_half_sec:.1f}%")
+    print(f"Premove Rate (<=0.15s):      {premoves:.1f}%")
+    print("-" * 80)
+
+    if cv < 0.25:
+        verdict = "[SUSPICIOUS] Metronomic cadence (Extremely low variance across moves)"
+    elif cv < 0.40:
+        verdict = "[BORDERLINE] Abnormally flat pacing for bullet time control"
+    elif lag1_r > 0.45:
+        verdict = "[SUSPICIOUS] High autocorrelation anomaly (Fixed timer/jitter signature)"
+    else:
+        verdict = "[CLEAN] Natural human dispersion (Chaotic motor variance)"
+
+    print(f"Diagnostic Pacing Verdict:   {verdict}")
+    print("=" * 80 + "\n")
+
+# -----------------------------------------------------------------------------
+# Module 6: Output Reports & Dispatcher
+# -----------------------------------------------------------------------------
+
+def print_behavioral_matrix_report(username: str, target_tc: str, total_decisions: int, total_games: int, matrix: list, pooled_times: list, pooled_tiers: list):
     print("\n" + "=" * 135)
     print(f"BEHAVIORAL MATRIX (Game State vs. Complexity) for '{username}'")
-    print(f"Sample: {total_decisions} decisions across {len(games_to_analyze)} games | TC: {target_tc}")
+    print(f"Sample: {total_decisions} decisions across {total_games} games | TC: {target_tc}")
     print("Cell format: [ Mean Time (s) | PV1 Match % | (n) ]")
     print("=" * 135)
 
@@ -428,30 +581,147 @@ def run_forensic_analysis(
 
     print("=" * 135)
 
-    corr, p_val = spearmanr(pooled_complexity_tiers, pooled_times)
-    mean_time = np.mean(pooled_times)
-    median_time = np.median(pooled_times)
-    std_time = np.std(pooled_times)
+    if total_decisions > 0:
+        corr, p_val = spearmanr(pooled_tiers, pooled_times)
+        mean_time = np.mean(pooled_times)
+        median_time = np.median(pooled_times)
+        std_time = np.std(pooled_times)
 
-    print("\nDIAGNOSTIC SUMMARY & TIMING PROFILE:")
-    print("-" * 60)
-    print(f"Total Middlegame Decisions: {total_decisions}")
-    print(f"Mean Think Time:            {mean_time:.2f}s (Std: {std_time:.2f}s, Median: {median_time:.2f}s)")
-    print(f"Spearman Rank Corr (ρ):     {corr:.4f} (p-value: {p_val:.4e})")
+        print("\nDIAGNOSTIC SUMMARY & TIMING PROFILE:")
+        print("-" * 60)
+        print(f"Total Middlegame Decisions: {total_decisions}")
+        print(f"Mean Think Time:            {mean_time:.2f}s (Std: {std_time:.2f}s, Median: {median_time:.2f}s)")
+        print(f"Spearman Rank Corr (ρ):     {corr:.4f} (p-value: {p_val:.4e})")
 
-    if total_decisions < 100 or p_val >= 0.05:
-        verdict = "INCONCLUSIVE (Insufficient decision volume or high p-value variance)"
-    elif corr >= 0.35:
-        verdict = "NORMAL HUMAN VARIANCE (Higher complexity -> deeper calculation)"
-    elif 0.15 <= corr < 0.35:
-        verdict = "MODERATE / MILD CADENCE SCALING"
-    elif -0.10 <= corr < 0.15:
-        verdict = "FLAT / DECOUPLED TIMING (Lack of cognitive scaling across difficulty tiers)"
+        if total_decisions < 100 or p_val >= 0.05:
+            verdict = "[INCONCLUSIVE] Insufficient decision volume or high p-value variance"
+        elif corr >= 0.35:
+            verdict = "[CLEAN] Normal human variance (Higher complexity -> deeper calculation)"
+        elif 0.15 <= corr < 0.35:
+            verdict = "[BORDERLINE] Moderate / mild cadence scaling"
+        elif -0.10 <= corr < 0.15:
+            verdict = "[SUSPICIOUS] Flat / decoupled timing (Lack of cognitive scaling across difficulty tiers)"
+        else:
+            verdict = "[SUSPICIOUS] Inverted cadence anomaly (Faster on sharp nodes than trivial ones)"
+
+        print(f"Aggregate Pacing Verdict:   {verdict}")
+        print("=" * 60 + "\n")
+
+def print_daily_report(username: str, target_tc: str, total_decisions: int, total_games: int, all_results: list):
+    pv1_matches = sum(1 for r in all_results if r[1])
+    pv1_overall_pct = (pv1_matches / total_decisions * 100) if total_decisions > 0 else 0.0
+
+    tier4_moves = [r for r in all_results if r[2] == 3]
+    tier4_count = len(tier4_moves)
+    tier4_matches = sum(1 for r in tier4_moves if r[1])
+    tier4_pct = (tier4_matches / tier4_count * 100) if tier4_count > 0 else 0.0
+
+    cpl_list = [r[4] for r in all_results]
+    acpl = float(np.mean(cpl_list)) if cpl_list else 0.0
+    blunders = sum(1 for c in cpl_list if c >= 100)
+    blunder_pct = (blunders / total_decisions * 100) if total_decisions > 0 else 0.0
+
+    print("\n" + "=" * 80)
+    print(f"DAILY / CORRESPONDENCE ENGINE FIDELITY PROFILE for '{username}'")
+    print(f"Sample: {total_decisions} middlegame decisions across {total_games} games | TC: {target_tc}")
+    print("=" * 80)
+    print(f"Overall PV1 Match Rate:          {pv1_overall_pct:.1f}% ({pv1_matches}/{total_decisions})")
+    print(f"Tier 4 (Highly Complex) PV1 Match: {tier4_pct:.1f}% ({tier4_matches}/{tier4_count})")
+    print(f"Average Centipawn Loss (ACPL):   {acpl:.1f} cp")
+    print(f"Blunder Rate (>= 100 cp loss):   {blunder_pct:.1f}% ({blunders}/{total_decisions})")
+    print("-" * 80)
+
+    if tier4_pct > 80.0 and acpl < 15.0:
+        verdict = "[SUSPICIOUS] High fidelity / engine-level resolution on complex nodes"
+    elif tier4_pct > 65.0 or acpl < 25.0:
+        verdict = "[BORDERLINE] Strong master-level correspondence play"
     else:
-        verdict = "INVERTED CADENCE ANOMALY (Faster on sharp nodes than trivial ones)"
+        verdict = "[CLEAN] Typical human correspondence profile (Sub-optimal resolution on complex branches)"
 
-    print(f"Aggregate Pacing Verdict:   {verdict}")
-    print("=" * 60 + "\n")
+    print(f"Engine Alignment Verdict:        {verdict}")
+    print("=" * 80 + "\n")
+
+def run_forensic_analysis(
+    username: str,
+    target_tc: str,
+    min_decisions: int,
+    book_path: str,
+    engine_path: str | None,
+    workers: int,
+    hash_per_worker: int,
+    depth: int
+):
+    tc_category = classify_time_control(target_tc)
+
+    if tc_category == "bullet":
+        print("[*] Bullet time detected! Entering the Matrix...")
+        print("[*] Bypassing engine evaluation: analyzing clock signatures and interval cadence only.")
+    elif tc_category == "blitz":
+        print("[*] Blitz stream detected (Gated Engine + Scramble Partitioning).")
+        print(f"[*] Filtering moves with clock < {MIN_BLITZ_CLOCK_RESERVE:.1f}s to isolate authentic calculation phase.")
+    elif tc_category == "rapid_classical":
+        print("[*] Rapid/Classical stream detected.")
+        print("[*] Launching full behavioral matrix profiling.")
+    elif tc_category == "daily":
+        print("[*] Daily/Correspondence stream detected.")
+        print("[*] Bypassing clock timestamps: running pure engine fidelity and Tier-4 precision profiling.")
+
+    if tc_category != "bullet" and not engine_path:
+        print("[-] Error: Stockfish binary not found in system PATH. Specify with --engine.", file=sys.stderr)
+        sys.exit(1)
+
+    game_pgns = verify_and_fetch_games(username, target_tc, min_decisions, book_path, tc_category)
+    total_games = len(game_pgns)
+
+    if tc_category == "bullet":
+        run_bullet_clock_analysis(username, target_tc, game_pgns)
+        return
+
+    print(f"\n[*] Step 3: Launching parallel engine pool ({workers} workers, {hash_per_worker}MB hash/worker, Depth: {depth})...")
+
+    matrix = [[[] for _ in range(4)] for _ in range(7)]
+    pooled_times = []
+    pooled_complexity_tiers = []
+    all_results = []
+    total_decisions = 0
+    processed_count = 0
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                analyze_single_game_engine,
+                idx,
+                pgn,
+                username,
+                target_tc,
+                tc_category,
+                book_path,
+                engine_path,
+                depth,
+                hash_per_worker
+            ): idx for idx, pgn in enumerate(game_pgns, 1)
+        }
+
+        for future in as_completed(futures):
+            processed_count += 1
+            try:
+                g_idx, date, opp, game_decisions, results = future.result()
+                total_decisions += game_decisions
+                all_results.extend(results)
+
+                for time_spent, is_pv1, c_idx, g_idx_eval, _ in results:
+                    matrix[g_idx_eval][c_idx].append((time_spent, is_pv1))
+                    pooled_times.append(time_spent)
+                    pooled_complexity_tiers.append(c_idx + 1)
+
+                print(f"  Finished [{processed_count}/{total_games}] Game #{g_idx} ({date} vs {opp}) -> +{game_decisions} decisions (Total: {total_decisions})")
+            except Exception as e:
+                print(f"  [-] Error analyzing game: {e}", file=sys.stderr)
+
+    if tc_category == "daily":
+        print_daily_report(username, target_tc, total_decisions, total_games, all_results)
+    else:
+        print_behavioral_matrix_report(username, target_tc, total_decisions, total_games, matrix, pooled_times, pooled_complexity_tiers)
 
 # -----------------------------------------------------------------------------
 # CLI Entry Point
@@ -459,19 +729,25 @@ def run_forensic_analysis(
 
 if __name__ == "__main__":
     system_stockfish = shutil.which("stockfish")
+    default_workers = min(12, os.cpu_count() or 1)
 
     parser = argparse.ArgumentParser(
         description=f"smoke-detector (v{__version__}): Longitudinal Chess Cadence and Complexity Profiler.",
         usage="%(prog)s player tc [options]"
     )
     parser.add_argument("player", help="Target Chess.com username")
-    parser.add_argument("tc", help="Exact TimeControl (e.g., 900+10, 600, 180+2)")
+    parser.add_argument("tc", help="Exact TimeControl (e.g., 900+10, 600, 180+2, 60, 1/86400)")
     parser.add_argument("--min-decisions", type=int, default=500, help="Target middlegame decision count (default: 500)")
-    parser.add_argument("--threads", type=int, default=12, help="Stockfish search worker threads (default: 12)")
-    parser.add_argument("--hash", type=int, default=12288, help="Stockfish shared hash memory in MB (default: 12288)")
+    parser.add_argument("--workers", type=int, default=default_workers, help=f"Parallel worker processes (default: {default_workers})")
+    parser.add_argument("--hash-per-worker", type=int, default=1024, help="Stockfish hash table per worker in MB (default: 1024)")
     parser.add_argument("--book", default="/usr/share/scid/books/Elo2400.bin", help="Path to Polyglot .bin book")
     parser.add_argument("--engine", default=system_stockfish, help="Path to Stockfish binary")
-    parser.add_argument("--depth", type=int, default=14, help="Stockfish search depth (default: 14)")
+    parser.add_argument("--depth", type=int, default=18, help="Stockfish search depth (default: 18)")
+
+    if len(sys.argv) == 1:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
+
     args = parser.parse_args()
 
     run_forensic_analysis(
@@ -480,7 +756,7 @@ if __name__ == "__main__":
         min_decisions=args.min_decisions,
         book_path=args.book,
         engine_path=args.engine,
-        threads=args.threads,
-        hash_mb=args.hash,
+        workers=args.workers,
+        hash_per_worker=args.hash_per_worker,
         depth=args.depth
     )
