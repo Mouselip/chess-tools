@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v1.0.12)
+# smoke-detector.py (v2.0.0)
 # Longitudinal Chess Cadence and Complexity Profiler
 #
 # Copyright (C) 2026 Tyrin R. Price
@@ -19,7 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "1.0.12"
+__version__ = "2.0.0"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -42,7 +42,7 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.12 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/2.0.0 (terminal-tool; python-chess)"
 DEFAULT_ENGINE_TIMEOUT = 8.0
 
 # -----------------------------------------------------------------------------
@@ -77,7 +77,10 @@ def classify_time_control(tc_str: str) -> str:
         return "rapid_classical"
 
 def fetch_json(url: str) -> dict | list | None:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
+    )
     try:
         with urllib.request.urlopen(req) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -90,14 +93,15 @@ def fetch_json(url: str) -> dict | list | None:
         print(f"Network error fetching {url}: {e}", file=sys.stderr)
         return None
 
-def fetch_text(url: str) -> str | None:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return resp.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        print(f"Error fetching PGN data from {url}: {e}", file=sys.stderr)
-        return None
+def has_setup_tag(pgn: str) -> bool:
+    if not pgn:
+        return False
+    for line in pgn.splitlines():
+        if line.startswith("[SetUp ") or line.startswith("[FEN "):
+            return True
+        if line.startswith("1. "):
+            break
+    return False
 
 # -----------------------------------------------------------------------------
 # Module 2: Clock & Phase Boundaries
@@ -161,7 +165,7 @@ def get_phase_boundaries(game: chess.pgn.Game, reader: chess.polyglot.MemoryMapp
     return mg_start, mg_end
 
 # -----------------------------------------------------------------------------
-# Module 3: Pre-flight Verification & Archive Harvester
+# Module 3: Pre-flight Verification & JSON Archive Harvester
 # -----------------------------------------------------------------------------
 
 def verify_and_fetch_games(
@@ -173,7 +177,7 @@ def verify_and_fetch_games(
     allow_unrated: bool = False
 ) -> list[str]:
     print(f"[*] Step 1: Verifying Chess.com account for '{username}'...")
-    profile_url = f"https://api.chess.com/pub/player/{username}"
+    profile_url = f"https://api.chess.com/pub/player/{username.lower()}"
     profile = fetch_json(profile_url)
 
     if profile is None:
@@ -181,7 +185,8 @@ def verify_and_fetch_games(
         sys.exit(1)
 
     status = profile.get("status", "unknown")
-    print(f"[+] Account verified: {profile.get('username', username)} (Status: {status})")
+    canonical_username = profile.get("username", username)
+    print(f"[+] Account verified: {canonical_username} (Status: {status})")
 
     reader = None
     if tc_category != "bullet":
@@ -192,11 +197,11 @@ def verify_and_fetch_games(
             sys.exit(1)
 
     print(f"[*] Step 2: Querying game archives...")
-    archives_url = f"https://api.chess.com/pub/player/{username}/games/archives"
+    archives_url = f"https://api.chess.com/pub/player/{canonical_username.lower()}/games/archives"
     archives_data = fetch_json(archives_url)
 
     if not archives_data or "archives" not in archives_data or not archives_data["archives"]:
-        print(f"[-] Error: No game archives found for '{username}'.", file=sys.stderr)
+        print(f"[-] Error: No game archives found for '{canonical_username}'.", file=sys.stderr)
         if reader is not None:
             reader.close()
         sys.exit(1)
@@ -207,44 +212,39 @@ def verify_and_fetch_games(
 
     selected_game_pgns = []
     accumulated_decisions = 0
+    rated_target = not allow_unrated
 
     for arch_url in archive_urls:
-        month_pgn_url = f"{arch_url}/pgn"
         month_label = f"{arch_url.split('/')[-2]}/{arch_url.split('/')[-1]}"
         print(f"[*] Fetching archive: {month_label}...")
-        pgn_text = fetch_text(month_pgn_url)
-        if not pgn_text:
+        month_data = fetch_json(arch_url)
+        if not month_data or "games" not in month_data:
             continue
 
-        pgn_io = io.StringIO(pgn_text)
-        month_games = []
-        while True:
-            g = chess.pgn.read_game(pgn_io)
-            if g is None:
-                break
-            month_games.append(g)
-
-        for game in reversed(month_games):
-            headers = game.headers
-
-            # Exclude ANY custom setup games
-            if headers.get("SetUp") == "1" or "FEN" in headers:
+        for game_obj in reversed(month_data.get("games", [])):
+            if not allow_unrated and game_obj.get("rated") != rated_target:
                 continue
 
-            # Rated game filter
-            if not allow_unrated:
-                rated_val = headers.get("Rated", "").lower()
-                if rated_val not in ["true", "1"]:
-                    continue
-
-            tc = headers.get("TimeControl", "")
+            tc = game_obj.get("time_control", "")
             if tc != target_tc:
+                continue
+
+            pgn_str = game_obj.get("pgn", "")
+            if not pgn_str or has_setup_tag(pgn_str):
+                continue
+
+            game = chess.pgn.read_game(io.StringIO(pgn_str))
+            if game is None:
+                continue
+
+            headers = game.headers
+            if headers.get("SetUp") == "1" or "FEN" in headers:
                 continue
 
             white = headers.get("White", "")
             black = headers.get("Black", "")
-            is_white = white.lower() == username.lower()
-            is_black = black.lower() == username.lower()
+            is_white = white.lower() == canonical_username.lower()
+            is_black = black.lower() == canonical_username.lower()
 
             if not (is_white or is_black):
                 continue
@@ -300,7 +300,7 @@ def verify_and_fetch_games(
         reader.close()
     print(f"[!] Reached end of available archives. Found {accumulated_decisions} decisions across {len(selected_game_pgns)} games.")
     if accumulated_decisions == 0:
-        print(f"[-] Error: No valid decisions found for '{username}' in time control '{target_tc}'.", file=sys.stderr)
+        print(f"[-] Error: No valid decisions found for '{canonical_username}' in time control '{target_tc}'.", file=sys.stderr)
         sys.exit(1)
 
     return selected_game_pgns
