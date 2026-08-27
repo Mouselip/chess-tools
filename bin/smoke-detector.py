@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v1.0.2)
+# smoke-detector.py (v1.0.3)
 # Longitudinal Chess Cadence and Complexity Profiler
 #
 # Copyright (C) 2026 Tyrin R. Price
@@ -19,7 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -41,8 +41,9 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.2 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.3 (terminal-tool; python-chess)"
 MIN_BLITZ_CLOCK_RESERVE = 25.0
+ENGINE_TIMEOUT_SECONDS = 30.0
 
 # -----------------------------------------------------------------------------
 # Module 1: Time Control Categorization & HTTP Helpers
@@ -352,17 +353,29 @@ def classify_complexity(scores: list[int], num_legal_moves: int) -> int:
     else:
         return 1
 
-def evaluate_position(engine: chess.engine.SimpleEngine, board: chess.Board, depth: int) -> dict:
+def evaluate_position(engine: chess.engine.SimpleEngine, board: chess.Board, depth: int, timeout: float = ENGINE_TIMEOUT_SECONDS) -> dict:
     legal_moves = list(board.legal_moves)
     num_legal = len(legal_moves)
     if num_legal == 0:
-        return {"scores": [0], "pv1": None, "num_legal": 0}
+        return {"scores": [0], "pv1": None, "num_legal": 0, "reached_depth": depth}
 
     multipv_count = min(3, num_legal)
-    info = engine.analyse(board, chess.engine.Limit(depth=depth), multipv=multipv_count)
+    try:
+        info = engine.analyse(
+            board,
+            chess.engine.Limit(depth=depth, time=timeout),
+            multipv=multipv_count
+        )
+    except (chess.engine.EngineError, chess.engine.EngineTerminatedError, TimeoutError):
+        return {"scores": [0], "pv1": None, "num_legal": num_legal, "reached_depth": 0}
 
     scores = []
     pv1_move = None
+    reached_depth = depth
+
+    if info:
+        reached_depth = info[0].get("depth", depth)
+
     for idx, entry in enumerate(info):
         score_obj = entry.get("score")
         if score_obj:
@@ -374,7 +387,7 @@ def evaluate_position(engine: chess.engine.SimpleEngine, board: chess.Board, dep
     if not scores:
         scores = [0]
 
-    return {"scores": scores, "pv1": pv1_move, "num_legal": num_legal}
+    return {"scores": scores, "pv1": pv1_move, "num_legal": num_legal, "reached_depth": reached_depth}
 
 # -----------------------------------------------------------------------------
 # Module 5: Workers & Stream Execution
@@ -390,7 +403,7 @@ def analyze_single_game_engine(
     engine_path: str,
     depth: int,
     hash_mb_per_worker: int
-) -> tuple[int, str, str, int, list[tuple[float, bool, int, int, int]]]:
+) -> tuple[int, str, str, int, int, list[tuple[float, bool, int, int, int]]]:
     reader = None
     if os.path.exists(book_path):
         try:
@@ -424,6 +437,7 @@ def analyze_single_game_engine(
     node = game
     ply = 0
     results = []
+    min_depth_reached = depth
 
     while node.variations:
         next_node = node.variation(0)
@@ -444,9 +458,13 @@ def analyze_single_game_engine(
                 node = next_node
                 continue
 
-            eval_res = evaluate_position(engine, board, depth=depth)
+            eval_res = evaluate_position(engine, board, depth=depth, timeout=ENGINE_TIMEOUT_SECONDS)
             scores = eval_res["scores"]
             pv1_move = eval_res["pv1"]
+            pos_depth = eval_res["reached_depth"]
+
+            if pos_depth < min_depth_reached:
+                min_depth_reached = pos_depth
 
             c_idx = classify_complexity(scores, eval_res["num_legal"])
             g_idx_eval = classify_game_state(scores[0])
@@ -456,7 +474,14 @@ def analyze_single_game_engine(
             if tc_category == "daily":
                 best_score = scores[0]
                 board.push(move)
-                info_after = engine.analyse(board, chess.engine.Limit(depth=depth), multipv=1)
+                try:
+                    info_after = engine.analyse(
+                        board,
+                        chess.engine.Limit(depth=depth, time=ENGINE_TIMEOUT_SECONDS),
+                        multipv=1
+                    )
+                except (chess.engine.EngineError, chess.engine.EngineTerminatedError, TimeoutError):
+                    info_after = []
                 board.pop()
                 if info_after and "score" in info_after[0]:
                     score_after_obj = info_after[0]["score"]
@@ -470,7 +495,7 @@ def analyze_single_game_engine(
         node = next_node
 
     engine.quit()
-    return game_idx, date, opp, len(results), results
+    return game_idx, date, opp, len(results), min_depth_reached, results
 
 def run_bullet_clock_analysis(username: str, target_tc: str, game_pgns: list[str]):
     print(f"\n[*] Step 3: Parsing clock timestamps across {len(game_pgns)} bullet games...")
@@ -668,7 +693,7 @@ def run_forensic_analysis(
 
     if tc_category != "bullet":
         print("[*] Engine & Boundary Configuration:")
-        print(f"    - Engine: Stockfish (Depth: {depth}, MultiPV: 3, Workers: {workers}, Hash/Worker: {hash_per_worker}MB)")
+        print(f"    - Engine: Stockfish (Depth: {depth}, MultiPV: 3, Workers: {workers}, Hash/Worker: {hash_per_worker}MB, Max Time/Move: {ENGINE_TIMEOUT_SECONDS}s)")
         print(f"    - Opening Book: {book_path}")
         print("    - Endgame Trigger: <= 4 non-pawn pieces OR (no queens AND <= 6 non-pawn pieces)")
 
@@ -711,7 +736,7 @@ def run_forensic_analysis(
         for future in as_completed(futures):
             processed_count += 1
             try:
-                g_idx, date, opp, game_decisions, results = future.result()
+                g_idx, date, opp, game_decisions, min_depth_reached, results = future.result()
                 total_decisions += game_decisions
                 all_results.extend(results)
 
@@ -720,7 +745,8 @@ def run_forensic_analysis(
                     pooled_times.append(time_spent)
                     pooled_complexity_tiers.append(c_idx + 1)
 
-                print(f"  Finished [{processed_count}/{total_games}] Game #{g_idx} ({date} vs {opp}) -> +{game_decisions} decisions (Total: {total_decisions})")
+                depth_str = f"[Min Depth: {min_depth_reached}]" if min_depth_reached >= depth else f"[Min Depth: {min_depth_reached} (CAPPED)]"
+                print(f"  Finished [{processed_count}/{total_games}] Game #{g_idx} ({date} vs {opp}) -> +{game_decisions} decisions (Total: {total_decisions}) {depth_str}")
             except Exception as e:
                 print(f"  [-] Error analyzing game: {e}", file=sys.stderr)
 
