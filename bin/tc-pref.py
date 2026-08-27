@@ -22,8 +22,8 @@ import sys
 import urllib.error
 import urllib.request
 
-VERSION = "0.0.2"
-USER_AGENT = "tc-pref/0.0.2"
+VERSION = "0.0.3"
+USER_AGENT = "tc-pref/0.0.3"
 
 
 def parse_args():
@@ -184,15 +184,14 @@ def main():
         print(f"No {game_type} games found in the selected archives.")
         sys.exit(0)
 
-    most_common_tc, most_common_count = tc_counts.most_common(1)[0]
-    pct = (most_common_count / total_matched_games) * 100
-
     print(f"Player: {username}")
     print(f"Scanned Archives: {len(target_archives)} month(s)")
-    print(f"Total Games Analyzed: {total_matched_games}")
-    print(
-        f"Preferred Time Control: {most_common_tc} ({format_tc(most_common_tc)}) - {most_common_count} games ({pct:.1f}%)"
-    )
+    print(f"Total Games Analyzed: {total_matched_games}\n")
+
+    for tc, count in tc_counts.most_common():
+        pct = (count / total_matched_games) * 100
+        formatted = format_tc(tc)
+        print(f"{tc:<10} ({formatted:<8}) : {count:>5} games ({pct:>5.1f}%)")
 
 
 if __name__ == "__main__":
