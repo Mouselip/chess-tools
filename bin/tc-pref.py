@@ -22,8 +22,8 @@ import sys
 import urllib.error
 import urllib.request
 
-VERSION = "0.0.3"
-USER_AGENT = "tc-pref/0.0.3"
+VERSION = "0.0.4"
+USER_AGENT = "tc-pref/0.0.4"
 
 
 def parse_args():
@@ -166,6 +166,7 @@ def main():
     tc_counts = Counter()
     total_matched_games = 0
     rated_target = not args.unrated
+    game_mode_label = "Unrated" if args.unrated else "Rated"
 
     for url in target_archives:
         month_data = fetch_json(url)
@@ -180,11 +181,11 @@ def main():
                 total_matched_games += 1
 
     if not tc_counts:
-        game_type = "unrated" if args.unrated else "rated"
-        print(f"No {game_type} games found in the selected archives.")
+        print(f"No {game_mode_label.lower()} games found in the selected archives.")
         sys.exit(0)
 
     print(f"Player: {username}")
+    print(f"Mode: {game_mode_label} Games")
     print(f"Scanned Archives: {len(target_archives)} month(s)")
     print(f"Total Games Analyzed: {total_matched_games}\n")
 
