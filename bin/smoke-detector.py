@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v1.0.10)
+# smoke-detector.py (v1.0.11)
 # Longitudinal Chess Cadence and Complexity Profiler
 #
 # Copyright (C) 2026 Tyrin R. Price
@@ -19,7 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "1.0.10"
+__version__ = "1.0.11"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -42,8 +42,7 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.10 (terminal-tool; python-chess)"
-MIN_BLITZ_CLOCK_RESERVE = 25.0
+USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.11 (terminal-tool; python-chess)"
 DEFAULT_ENGINE_TIMEOUT = 8.0
 
 # -----------------------------------------------------------------------------
@@ -270,12 +269,6 @@ def verify_and_fetch_games(
                     turn = board.turn
                     ply += 1
                     if mg_start <= ply <= mg_end and turn == target_color:
-                        if tc_category == "blitz":
-                            clk = parse_clock(next_node.comment)
-                            if clk is not None and clk < MIN_BLITZ_CLOCK_RESERVE:
-                                board.push(next_node.move)
-                                node = next_node
-                                continue
                         player_mg_moves += 1
                     board.push(next_node.move)
                     node = next_node
@@ -355,44 +348,75 @@ def classify_complexity(white_scores: list[int], num_legal_moves: int) -> int:
     else:
         return 1
 
-def evaluate_position(engine: chess.engine.SimpleEngine, board: chess.Board, depth: int, timeout: float = DEFAULT_ENGINE_TIMEOUT) -> dict:
-    legal_moves = list(board.legal_moves)
-    num_legal = len(legal_moves)
-    if num_legal == 0:
-        return {"scores": [0], "pv1": None, "num_legal": 0, "reached_depth": depth, "eval_time": 0.0}
+def spawn_engine(engine_path: str, hash_mb: int) -> chess.engine.SimpleEngine:
+    engine = chess.engine.SimpleEngine.popen_uci(engine_path)
+    engine.configure({
+        "Threads": 1,
+        "Hash": hash_mb
+    })
+    return engine
 
-    multipv_count = min(3, num_legal)
+def safe_analyse_position(
+    engine: chess.engine.SimpleEngine,
+    board: chess.Board,
+    multipv: int,
+    depth: int,
+    timeout: float,
+    engine_path: str,
+    hash_mb: int
+) -> tuple[chess.engine.SimpleEngine, list, float]:
     t0 = time.perf_counter()
     try:
         info = engine.analyse(
             board,
             chess.engine.Limit(depth=depth, time=timeout),
-            multipv=multipv_count
+            multipv=multipv
         )
-    except (chess.engine.EngineError, chess.engine.EngineTerminatedError, TimeoutError):
         eval_time = time.perf_counter() - t0
-        return {"scores": [0], "pv1": None, "num_legal": num_legal, "reached_depth": 0, "eval_time": eval_time}
+        return engine, info, eval_time
+    except (chess.engine.EngineError, chess.engine.EngineTerminatedError, TimeoutError, Exception):
+        try:
+            engine.close()
+        except Exception:
+            pass
+        new_engine = spawn_engine(engine_path, hash_mb)
+        eval_time = time.perf_counter() - t0
+        return new_engine, [], eval_time
 
-    eval_time = time.perf_counter() - t0
+def evaluate_position(
+    engine: chess.engine.SimpleEngine,
+    board: chess.Board,
+    depth: int,
+    timeout: float,
+    engine_path: str,
+    hash_mb: int
+) -> tuple[chess.engine.SimpleEngine, dict]:
+    legal_moves = list(board.legal_moves)
+    num_legal = len(legal_moves)
+    if num_legal == 0:
+        return engine, {"scores": [0], "pv1": None, "num_legal": 0, "reached_depth": depth, "eval_time": 0.0}
+
+    multipv_count = min(3, num_legal)
+    engine, info, eval_time = safe_analyse_position(engine, board, multipv_count, depth, timeout, engine_path, hash_mb)
+
     white_scores = []
     pv1_move = None
     reached_depth = depth
 
     if info:
         reached_depth = info[0].get("depth", depth)
-
-    for idx, entry in enumerate(info):
-        score_obj = entry.get("score")
-        if score_obj:
-            cp = score_obj.white().score(mate_score=10000)
-            white_scores.append(cp if cp is not None else 0)
-        if idx == 0 and "pv" in entry and entry["pv"]:
-            pv1_move = entry["pv"][0]
+        for idx, entry in enumerate(info):
+            score_obj = entry.get("score")
+            if score_obj:
+                cp = score_obj.white().score(mate_score=10000)
+                white_scores.append(cp if cp is not None else 0)
+            if idx == 0 and "pv" in entry and entry["pv"]:
+                pv1_move = entry["pv"][0]
 
     if not white_scores:
         white_scores = [0]
 
-    return {
+    return engine, {
         "scores": white_scores,
         "pv1": pv1_move,
         "num_legal": num_legal,
@@ -423,11 +447,7 @@ def analyze_single_game_engine(
         except Exception:
             reader = None
 
-    engine = chess.engine.SimpleEngine.popen_uci(engine_path)
-    engine.configure({
-        "Threads": 1,
-        "Hash": hash_mb_per_worker
-    })
+    engine = spawn_engine(engine_path, hash_mb_per_worker)
 
     game = chess.pgn.read_game(io.StringIO(pgn_str))
     headers = game.headers
@@ -468,12 +488,10 @@ def analyze_single_game_engine(
             prev_clocks[turn] = curr_clock
 
         if mg_start <= ply <= mg_end and turn == target_color:
-            if tc_category == "blitz" and curr_clock is not None and curr_clock < MIN_BLITZ_CLOCK_RESERVE:
-                board.push(move)
-                node = next_node
-                continue
-
-            eval_res = evaluate_position(engine, board, depth=depth, timeout=engine_timeout)
+            engine, eval_res = evaluate_position(
+                engine, board, depth=depth, timeout=engine_timeout,
+                engine_path=engine_path, hash_mb=hash_mb_per_worker
+            )
             white_scores = eval_res["scores"]
             pv1_move = eval_res["pv1"]
             pos_depth = eval_res["reached_depth"]
@@ -490,14 +508,11 @@ def analyze_single_game_engine(
 
             best_white_score = white_scores[0]
             board.push(move)
-            try:
-                info_after = engine.analyse(
-                    board,
-                    chess.engine.Limit(depth=depth, time=engine_timeout),
-                    multipv=1
-                )
-            except (chess.engine.EngineError, chess.engine.EngineTerminatedError, TimeoutError):
-                info_after = []
+
+            engine, info_after, _ = safe_analyse_position(
+                engine, board, multipv=1, depth=depth, timeout=engine_timeout,
+                engine_path=engine_path, hash_mb=hash_mb_per_worker
+            )
             board.pop()
 
             after_white_score = best_white_score
@@ -530,7 +545,10 @@ def analyze_single_game_engine(
         board.push(move)
         node = next_node
 
-    engine.quit()
+    try:
+        engine.quit()
+    except Exception:
+        pass
 
     avg_engine_time = float(np.mean(engine_times)) if engine_times else 0.0
     max_engine_time = float(np.max(engine_times)) if engine_times else 0.0
@@ -807,8 +825,8 @@ def run_forensic_analysis(
         print("[*] Bullet time detected! Entering the Matrix...")
         print("[*] Bypassing engine evaluation: analyzing clock signatures and interval cadence only.")
     elif tc_category == "blitz":
-        print("[*] Blitz stream detected (Gated Engine + Scramble Partitioning).")
-        print(f"[*] Filtering moves with clock < {MIN_BLITZ_CLOCK_RESERVE:.1f}s to isolate authentic calculation phase.")
+        print("[*] Blitz stream detected.")
+        print("[*] Evaluating complete middlegame decisions across all clock states.")
     elif tc_category == "rapid_classical":
         print("[*] Rapid/Classical stream detected.")
         print("[*] Launching full behavioral matrix profiling.")
