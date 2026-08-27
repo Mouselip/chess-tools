@@ -22,21 +22,18 @@ import sys
 import urllib.error
 import urllib.request
 
-VERSION = "0.0.1"
-USER_AGENT = "tc-pref/0.0.1"
+VERSION = "0.0.2"
+USER_AGENT = "tc-pref/0.0.2"
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="tc-pref.py",
+        usage="%(prog)s [OPTIONS] USERNAME",
         description="Scan a target player's Chess.com archives to find their most preferred time control.",
         epilog="Copyright (C) 2026 Tyrin R. Price. Released under GNU GPL v3.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
-
-    if len(sys.argv) == 1:
-        parser.print_help(sys.stderr)
-        sys.exit(1)
 
     parser.add_argument(
         "username",
@@ -73,6 +70,10 @@ def parse_args():
         action="version",
         version=f"%(prog)s v{VERSION}",
     )
+
+    if len(sys.argv) == 1:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
 
     return parser.parse_args()
 
