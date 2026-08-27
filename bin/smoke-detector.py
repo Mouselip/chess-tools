@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v2.0.0)
+# smoke-detector.py (v2.0.1)
 # Longitudinal Chess Cadence and Complexity Profiler
 #
 # Copyright (C) 2026 Tyrin R. Price
@@ -19,7 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -42,7 +42,7 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/2.0.0 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/2.0.1 (terminal-tool; python-chess)"
 DEFAULT_ENGINE_TIMEOUT = 8.0
 
 # -----------------------------------------------------------------------------
@@ -97,7 +97,7 @@ def has_setup_tag(pgn: str) -> bool:
     if not pgn:
         return False
     for line in pgn.splitlines():
-        if line.startswith("[SetUp ") or line.startswith("[FEN "):
+        if line.startswith("[SetUp "):
             return True
         if line.startswith("1. "):
             break
@@ -238,7 +238,7 @@ def verify_and_fetch_games(
                 continue
 
             headers = game.headers
-            if headers.get("SetUp") == "1" or "FEN" in headers:
+            if headers.get("SetUp") == "1":
                 continue
 
             white = headers.get("White", "")
