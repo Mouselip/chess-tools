@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v1.0.7)
+# smoke-detector.py (v1.0.8)
 # Longitudinal Chess Cadence and Complexity Profiler
 #
 # Copyright (C) 2026 Tyrin R. Price
@@ -19,7 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -42,9 +42,9 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.7 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.8 (terminal-tool; python-chess)"
 MIN_BLITZ_CLOCK_RESERVE = 25.0
-DEFAULT_ENGINE_TIMEOUT = 5.0
+DEFAULT_ENGINE_TIMEOUT = 8.0
 
 # -----------------------------------------------------------------------------
 # Module 1: Time Control Categorization & HTTP Helpers
