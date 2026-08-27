@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v1.0.5)
+# smoke-detector.py (v1.0.7)
 # Longitudinal Chess Cadence and Complexity Profiler
 #
 # Copyright (C) 2026 Tyrin R. Price
@@ -19,7 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "1.0.5"
+__version__ = "1.0.7"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -42,7 +42,7 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.5 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.7 (terminal-tool; python-chess)"
 MIN_BLITZ_CLOCK_RESERVE = 25.0
 DEFAULT_ENGINE_TIMEOUT = 5.0
 
@@ -513,6 +513,7 @@ def analyze_single_game_engine(
                 "move_num": (ply + 1) // 2,
                 "san": board.san(move),
                 "is_pv1": is_pv1,
+                "best_score": best_score,
                 "eval_drop": eval_drop,
                 "score_after": score_after,
                 "time_spent": time_spent,
@@ -528,30 +529,29 @@ def analyze_single_game_engine(
     max_engine_time = float(np.max(engine_times)) if engine_times else 0.0
 
     # -------------------------------------------------------------------------
-    # Red Flag Detector: Loss Laundering / Cliff Drop Anomaly
+    # Endgame State Inversion / Thrown Game Red Flag Detector
     # -------------------------------------------------------------------------
     anomaly_flag = None
-    if len(decisions_eval_history) >= 15 and tc_category != "bullet":
-        prior_decisions = decisions_eval_history[:-1]
-        prior_pv1_count = sum(1 for d in prior_decisions if d["is_pv1"])
-        prior_pv1_pct = (prior_pv1_count / len(prior_decisions)) * 100.0
-
+    if len(decisions_eval_history) >= 10 and tc_category != "bullet":
         final_d = decisions_eval_history[-1]
-        is_blunder_drop = final_d["eval_drop"] >= 800 or final_d["score_after"] <= -800
+        penultimate_d = decisions_eval_history[-2]
+
+        prior_state_viable = (penultimate_d["score_after"] >= -100 or penultimate_d["best_score"] >= -100)
+        is_terminal_blunder = (final_d["eval_drop"] >= 600 or final_d["score_after"] <= -800)
         has_comfortable_clock = (final_d["curr_clock"] is not None and final_d["curr_clock"] >= 60.0) or (tc_category == "daily")
         deliberate_time = final_d["time_spent"] >= 3.0 or tc_category == "daily"
 
-        if prior_pv1_pct >= 75.0 and is_blunder_drop and has_comfortable_clock and deliberate_time:
+        if prior_state_viable and is_terminal_blunder and has_comfortable_clock and deliberate_time:
             clock_repr = f"{int(final_d['curr_clock']//60)}m{int(final_d['curr_clock']%60):02d}s" if final_d["curr_clock"] is not None else "Daily"
+            eval_desc = f"-{final_d['eval_drop']} cp" if final_d["score_after"] > -8000 else "allowed mate"
             anomaly_flag = {
                 "game_idx": game_idx,
                 "date": date,
                 "opp": opp,
-                "prior_pv1_pct": prior_pv1_pct,
-                "prior_moves": len(prior_decisions),
                 "blunder_move": final_d["move_num"],
                 "blunder_san": final_d["san"],
-                "eval_drop": final_d["eval_drop"],
+                "eval_desc": eval_desc,
+                "prior_eval": f"{penultimate_d['score_after']} cp",
                 "clock_left": clock_repr,
                 "think_time": final_d["time_spent"]
             }
@@ -731,13 +731,13 @@ def print_detected_anomalies(anomalies: list[dict]):
     if not anomalies:
         return
     print("\n" + "!" * 80)
-    print(f"FORENSIC ALERT: {len(anomalies)} LOSS LAUNDERING / CLIFF DROP ANOMALIES DETECTED")
+    print(f"FORENSIC ALERT: {len(anomalies)} SUSPICIOUS RESULT MANIPULATION / THROWN GAME ANOMALIES DETECTED")
     print("!" * 80)
     for a in anomalies:
         print(f"  * Game #{a['game_idx']} ({a['date']} vs {a['opp']}):")
-        print(f"      - Prior Fidelity:  {a['prior_pv1_pct']:.1f}% PV1 match across {a['prior_moves']} middlegame decisions")
-        print(f"      - Terminal Move:   Move {a['blunder_move']}. {a['blunder_san']} (Eval drop: -{a['eval_drop']} cp)")
-        print(f"      - Clock at Move:   {a['clock_left']} remaining (Spent {a['think_time']:.1f}s calculating blunder)")
+        print(f"      - Position Viability: Prior move held stable eval ({a['prior_eval']})")
+        print(f"      - Terminal Collapse:  Move {a['blunder_move']}. {a['blunder_san']} ({a['eval_desc']})")
+        print(f"      - Non-Panic Clock:    {a['clock_left']} in reserve (Spent {a['think_time']:.1f}s calculating blunder)")
     print("!" * 80 + "\n")
 
 def run_forensic_analysis(
@@ -837,7 +837,7 @@ def run_forensic_analysis(
 
                 depth_part = f"Min Depth: {min_depth_reached}" if min_depth_reached >= depth else f"Min Depth: {min_depth_reached} (CAPPED)"
                 timing_str = f"[Avg: {avg_engine_t:.2f}s/mv | Max Time: {max_engine_t:.2f}s | {depth_part}]"
-                flag_str = " [FLAG: LOSS_LAUNDERING_ANOMALY]" if anomaly else ""
+                flag_str = " [FLAG: THROWN_GAME_ANOMALY]" if anomaly else ""
                 print(f"  Finished [{processed_count}/{total_games}] Game #{g_idx} ({date} vs {opp}) -> +{game_decisions} decisions (Total: {total_decisions}) {timing_str}{flag_str}")
             except Exception as e:
                 print(f"  [-] Error analyzing game: {e}", file=sys.stderr)
