@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v1.0.8)
+# smoke-detector.py (v1.0.9)
 # Longitudinal Chess Cadence and Complexity Profiler
 #
 # Copyright (C) 2026 Tyrin R. Price
@@ -19,7 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "1.0.8"
+__version__ = "1.0.9"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -42,7 +42,7 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.8 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/1.0.9 (terminal-tool; python-chess)"
 MIN_BLITZ_CLOCK_RESERVE = 25.0
 DEFAULT_ENGINE_TIMEOUT = 8.0
 
@@ -321,27 +321,28 @@ COMPLEXITY_TIERS = [
     "Tier 4: Highly Complex"
 ]
 
-def classify_game_state(score_cp: int) -> int:
-    if score_cp >= 400:
+def classify_game_state(score_white_cp: int, turn: chess.Color) -> int:
+    player_score = score_white_cp if turn == chess.WHITE else -score_white_cp
+    if player_score >= 400:
         return 0
-    elif score_cp >= 175:
+    elif player_score >= 175:
         return 1
-    elif score_cp >= 60:
+    elif player_score >= 60:
         return 2
-    elif score_cp > -60:
+    elif player_score > -60:
         return 3
-    elif score_cp > -175:
+    elif player_score > -175:
         return 4
-    elif score_cp > -400:
+    elif player_score > -400:
         return 5
     else:
         return 6
 
-def classify_complexity(scores: list[int], num_legal_moves: int) -> int:
-    if num_legal_moves <= 1 or len(scores) < 2:
+def classify_complexity(white_scores: list[int], num_legal_moves: int) -> int:
+    if num_legal_moves <= 1 or len(white_scores) < 2:
         return 0
-    d12 = abs(scores[0] - scores[1])
-    d13 = abs(scores[0] - scores[2]) if len(scores) > 2 else d12
+    d12 = abs(white_scores[0] - white_scores[1])
+    d13 = abs(white_scores[0] - white_scores[2]) if len(white_scores) > 2 else d12
 
     if d12 >= 300:
         return 0
@@ -373,7 +374,7 @@ def evaluate_position(engine: chess.engine.SimpleEngine, board: chess.Board, dep
         return {"scores": [0], "pv1": None, "num_legal": num_legal, "reached_depth": 0, "eval_time": eval_time}
 
     eval_time = time.perf_counter() - t0
-    scores = []
+    white_scores = []
     pv1_move = None
     reached_depth = depth
 
@@ -383,16 +384,16 @@ def evaluate_position(engine: chess.engine.SimpleEngine, board: chess.Board, dep
     for idx, entry in enumerate(info):
         score_obj = entry.get("score")
         if score_obj:
-            cp = score_obj.pov(board.turn).score(mate_score=10000)
-            scores.append(cp if cp is not None else 0)
+            cp = score_obj.white().score(mate_score=10000)
+            white_scores.append(cp if cp is not None else 0)
         if idx == 0 and "pv" in entry and entry["pv"]:
             pv1_move = entry["pv"][0]
 
-    if not scores:
-        scores = [0]
+    if not white_scores:
+        white_scores = [0]
 
     return {
-        "scores": scores,
+        "scores": white_scores,
         "pv1": pv1_move,
         "num_legal": num_legal,
         "reached_depth": reached_depth,
@@ -436,6 +437,7 @@ def analyze_single_game_engine(
     target_color = chess.WHITE if is_white else chess.BLACK
     opp = black if is_white else white
     date = headers.get("Date", "????.??.??")
+    result_header = headers.get("Result", "*")
 
     mg_start, mg_end = get_phase_boundaries(game, reader)
     if reader is not None:
@@ -472,7 +474,7 @@ def analyze_single_game_engine(
                 continue
 
             eval_res = evaluate_position(engine, board, depth=depth, timeout=engine_timeout)
-            scores = eval_res["scores"]
+            white_scores = eval_res["scores"]
             pv1_move = eval_res["pv1"]
             pos_depth = eval_res["reached_depth"]
             eval_t = eval_res["eval_time"]
@@ -482,11 +484,11 @@ def analyze_single_game_engine(
             if pos_depth < min_depth_reached:
                 min_depth_reached = pos_depth
 
-            c_idx = classify_complexity(scores, eval_res["num_legal"])
-            g_idx_eval = classify_game_state(scores[0])
+            c_idx = classify_complexity(white_scores, eval_res["num_legal"])
+            g_idx_eval = classify_game_state(white_scores[0], turn)
             is_pv1 = (move == pv1_move)
 
-            best_score = scores[0]
+            best_white_score = white_scores[0]
             board.push(move)
             try:
                 info_after = engine.analyse(
@@ -498,24 +500,29 @@ def analyze_single_game_engine(
                 info_after = []
             board.pop()
 
-            score_after = best_score
+            after_white_score = best_white_score
             if info_after and "score" in info_after[0]:
                 score_after_obj = info_after[0]["score"]
-                after_val = score_after_obj.pov(turn).score(mate_score=10000)
+                after_val = score_after_obj.white().score(mate_score=10000)
                 if after_val is not None:
-                    score_after = after_val
+                    after_white_score = after_val
 
-            cpl = max(0, best_score - score_after)
-            eval_drop = best_score - score_after
+            if turn == chess.WHITE:
+                eval_drop = best_white_score - after_white_score
+            else:
+                eval_drop = after_white_score - best_white_score
+
+            cpl = max(0, eval_drop)
 
             results.append((time_spent, is_pv1, c_idx, g_idx_eval, cpl))
             decisions_eval_history.append({
+                "ply": ply,
                 "move_num": (ply + 1) // 2,
                 "san": board.san(move),
                 "is_pv1": is_pv1,
-                "best_score": best_score,
+                "best_white_score": best_white_score,
+                "after_white_score": after_white_score,
                 "eval_drop": eval_drop,
-                "score_after": score_after,
                 "time_spent": time_spent,
                 "curr_clock": curr_clock
             })
@@ -529,21 +536,33 @@ def analyze_single_game_engine(
     max_engine_time = float(np.max(engine_times)) if engine_times else 0.0
 
     # -------------------------------------------------------------------------
-    # Endgame State Inversion / Thrown Game Red Flag Detector
+    # Thrown Game Red Flag Detector (Gated on Target Loss & Absolute Scores)
     # -------------------------------------------------------------------------
     anomaly_flag = None
-    if len(decisions_eval_history) >= 10 and tc_category != "bullet":
+    target_lost = (is_white and result_header == "0-1") or (not is_white and result_header == "1-0")
+
+    if target_lost and len(decisions_eval_history) >= 10 and tc_category != "bullet":
         final_d = decisions_eval_history[-1]
         penultimate_d = decisions_eval_history[-2]
 
-        prior_state_viable = (penultimate_d["score_after"] >= -100 or penultimate_d["best_score"] >= -100)
-        is_terminal_blunder = (final_d["eval_drop"] >= 600 or final_d["score_after"] <= -800)
+        is_game_end_decision = (final_d["ply"] >= ply - 2)
+
+        if is_white:
+            prior_state_viable = (penultimate_d["after_white_score"] >= -100 or penultimate_d["best_white_score"] >= -100)
+            is_terminal_blunder = (final_d["eval_drop"] >= 600 or final_d["after_white_score"] <= -800)
+            eval_desc = f"-{final_d['eval_drop']} cp" if final_d["after_white_score"] > -8000 else "allowed mate"
+            prior_eval_str = f"{penultimate_d['after_white_score']} cp"
+        else:
+            prior_state_viable = (penultimate_d["after_white_score"] <= 100 or penultimate_d["best_white_score"] <= 100)
+            is_terminal_blunder = (final_d["eval_drop"] >= 600 or final_d["after_white_score"] >= 800)
+            eval_desc = f"-{final_d['eval_drop']} cp" if final_d["after_white_score"] < 8000 else "allowed mate"
+            prior_eval_str = f"{penultimate_d['after_white_score']} cp"
+
         has_comfortable_clock = (final_d["curr_clock"] is not None and final_d["curr_clock"] >= 60.0) or (tc_category == "daily")
         deliberate_time = final_d["time_spent"] >= 3.0 or tc_category == "daily"
 
-        if prior_state_viable and is_terminal_blunder and has_comfortable_clock and deliberate_time:
+        if is_game_end_decision and prior_state_viable and is_terminal_blunder and has_comfortable_clock and deliberate_time:
             clock_repr = f"{int(final_d['curr_clock']//60)}m{int(final_d['curr_clock']%60):02d}s" if final_d["curr_clock"] is not None else "Daily"
-            eval_desc = f"-{final_d['eval_drop']} cp" if final_d["score_after"] > -8000 else "allowed mate"
             anomaly_flag = {
                 "game_idx": game_idx,
                 "date": date,
@@ -551,7 +570,7 @@ def analyze_single_game_engine(
                 "blunder_move": final_d["move_num"],
                 "blunder_san": final_d["san"],
                 "eval_desc": eval_desc,
-                "prior_eval": f"{penultimate_d['score_after']} cp",
+                "prior_eval": prior_eval_str,
                 "clock_left": clock_repr,
                 "think_time": final_d["time_spent"]
             }
