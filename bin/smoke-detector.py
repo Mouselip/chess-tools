@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v2.0.1)
-# Longitudinal Chess Cadence and Complexity Profiler
+# smoke-detector.py (v2.0.2)
+# Chess.com fair play and rating manipulation screener: analyzes move
+# cadence, sharp-position engine alignment, and intentional losses to flag
+# suspicious indicators ("smoke") without providing definitive proof of
+# fair play or cheating.
 #
 # Copyright (C) 2026 Tyrin R. Price
 #
@@ -19,7 +22,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -42,7 +45,7 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/2.0.1 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/2.0.2 (terminal-tool; python-chess)"
 DEFAULT_ENGINE_TIMEOUT = 8.0
 
 # -----------------------------------------------------------------------------
@@ -952,7 +955,7 @@ if __name__ == "__main__":
     default_workers = min(12, os.cpu_count() or 1)
 
     parser = argparse.ArgumentParser(
-        description=f"smoke-detector (v{__version__}): Longitudinal Chess Cadence and Complexity Profiler.",
+        description=f"smoke-detector (v{__version__}): Chess.com fair play and rating manipulation screener.",
         usage="%(prog)s player tc [options]"
     )
     parser.add_argument("player", help="Target Chess.com username")
