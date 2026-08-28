@@ -20,22 +20,17 @@
 # Description:
 #   Scans the Chess.com public archives for a target player, filtering
 #   for rated games across bullet, blitz, rapid, and daily categories.
-#   Retrieves player profile metadata to report account status at the top.
-#   Reports game counts, W-D-L records, overall score percentage (Wins + 0.5*Draws),
-#   latest rating, last played date per category, and the rating spread
-#   between highest and lowest categories. Detects suspicious streaks of
-#   consecutive short-ply games (0 < ply <= 13) regardless of opponent to
-#   identify rating farming, sandbagging, or rapid rating dumping with event
-#   categorization and dual player/opponent ratings. Evaluates rating
-#   trajectories by categorizing dormancy gaps into standard (>= 30 days) and
-#   extended (>= 90 days) tiers with return session trajectory tracking (first 5
-#   games back). Flags high-density rapid rating surges bounded strictly by
-#   calendar time, minimum game volume, daily velocity, and anomalous win rate
-#   floors, filtering out high-volume speed-pool grinding and onboarding noise
-#   with normalized sub-day time clamping. Concludes with a graduated synthesized
+#   Retrieves player profile metadata to report account status and title.
+#   Reports game counts, W-D-L records, overall score percentage, average
+#   accuracy with analysis coverage counts, latest rating, last played date
+#   per category, and rating spread. Detects suspicious streaks of consecutive
+#   short-ply games (0 < ply <= 13) and consecutive high-accuracy games
+#   (accuracy >= 94.0%, ply >= 30, strictly consecutive in actual play).
+#   Evaluates rating trajectories, dormancy gaps, and high-velocity surges
+#   with density-gated accuracy corroboration. Concludes with a synthesized
 #   verdict (Human, Smoke, or Fire) evaluating fair-play risk.
 #
-# Version: v0.1.1
+# Version: v0.1.2
 
 import argparse
 import datetime
@@ -46,7 +41,7 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.1.1 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.1.2 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid", "daily")
@@ -66,6 +61,12 @@ DEFAULT_SURGE_MIN_GAMES = 15
 DEFAULT_SURGE_MIN_VELOCITY = 20.0
 DEFAULT_SURGE_IGNORE_ONBOARDING = 50
 DEFAULT_SURGE_MIN_WIN_RATE = 75.0
+
+# Accuracy defaults
+DEFAULT_MIN_ACC_STREAK = 3
+DEFAULT_MIN_ACC_PLY = 30
+DEFAULT_ACC_STREAK_THRESHOLD = 94.0
+MIN_ANALYZED_THRESHOLD = 10
 
 
 def fetch_json(url):
@@ -124,7 +125,7 @@ def extract_event_type(pgn_str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scan Chess.com archives for rated games, summaries, short-ply streaks, dormancy gaps, and surges."
+        description="Scan Chess.com archives for rated games, summaries, short-ply streaks, accuracy streaks, dormancy gaps, and surges."
     )
     parser.add_argument("username", help="Chess.com target username")
     parser.add_argument(
@@ -199,6 +200,24 @@ def main():
         default=DEFAULT_SURGE_MIN_WIN_RATE,
         help=f"Minimum win rate percentage required to flag an anomalous surge (default: {DEFAULT_SURGE_MIN_WIN_RATE}%%)",
     )
+    parser.add_argument(
+        "--acc-min-streak",
+        type=int,
+        default=DEFAULT_MIN_ACC_STREAK,
+        help=f"Minimum consecutive high-accuracy games to flag as a streak (default: {DEFAULT_MIN_ACC_STREAK})",
+    )
+    parser.add_argument(
+        "--acc-min-ply",
+        type=int,
+        default=DEFAULT_MIN_ACC_PLY,
+        help=f"Minimum ply required to count an accuracy score toward a streak (default: {DEFAULT_MIN_ACC_PLY})",
+    )
+    parser.add_argument(
+        "--acc-threshold",
+        type=float,
+        default=DEFAULT_ACC_STREAK_THRESHOLD,
+        help=f"Minimum accuracy percentage required for streak games (default: {DEFAULT_ACC_STREAK_THRESHOLD}%%)",
+    )
     args = parser.parse_args()
 
     username = args.username.strip()
@@ -239,6 +258,8 @@ def main():
             "wins": 0,
             "draws": 0,
             "losses": 0,
+            "accuracy_sum": 0.0,
+            "accuracy_count": 0,
             "latest_rating": None,
             "last_played_ts": 0,
         }
@@ -277,18 +298,25 @@ def main():
             white_lower = white_user.lower()
             black_lower = black_user.lower()
 
+            accuracies = game.get("accuracies")
+            player_acc = None
+
             if white_lower == username_lower:
                 player_color = "white"
                 player_rating = white.get("rating")
                 player_result = white.get("result", "")
                 opponent_name = black_user
                 opponent_rating = black.get("rating")
+                if isinstance(accuracies, dict):
+                    player_acc = accuracies.get("white")
             elif black_lower == username_lower:
                 player_color = "black"
                 player_rating = black.get("rating")
                 player_result = black.get("result", "")
                 opponent_name = white_user
                 opponent_rating = white.get("rating")
+                if isinstance(accuracies, dict):
+                    player_acc = accuracies.get("black")
             else:
                 continue
 
@@ -311,6 +339,10 @@ def main():
                 else:
                     stats[time_class]["losses"] += 1
 
+                if player_acc is not None:
+                    stats[time_class]["accuracy_sum"] += float(player_acc)
+                    stats[time_class]["accuracy_count"] += 1
+
                 if end_time >= stats[time_class]["last_played_ts"]:
                     stats[time_class]["last_played_ts"] = end_time
                     stats[time_class]["latest_rating"] = player_rating
@@ -327,6 +359,7 @@ def main():
                 "ply": ply_count,
                 "outcome": outcome,
                 "color": player_color,
+                "accuracy": float(player_acc) if player_acc is not None else None,
                 "event_type": event_type,
                 "opponent": opponent_name,
                 "opponent_rating": opponent_rating if opponent_rating is not None else 0,
@@ -347,14 +380,17 @@ def main():
         category_games[cat].sort(key=lambda g: g["end_time"])
 
     # Section 1: Rating Summary Output
-    print("=" * 88, flush=True)
+    print("=" * 102, flush=True)
     title_str = f" [{player_title}]" if player_title else ""
     print(f" RATED RATING SUMMARY: {username}{title_str} | Status: {account_status}", flush=True)
-    print("=" * 88, flush=True)
-    print(f"{'Category':<10} | {'Games':<8} | {'W-D-L':<15} | {'Score %':<9} | {'Rating':<8} | {'Last Played (UTC)':<20}", flush=True)
-    print("-" * 88, flush=True)
+    print("=" * 102, flush=True)
+    print(f"{'Category':<10} | {'Games':<8} | {'W-D-L':<15} | {'Score %':<9} | {'Avg Acc (Analyzed)':<22} | {'Rating':<8} | {'Last Played (UTC)':<20}", flush=True)
+    print("-" * 102, flush=True)
 
     active_categories = {}
+    total_acc_count = 0
+    total_games_all = len(all_rated_games)
+
     for cat in TARGET_CATEGORIES:
         data = stats[cat]
         count = data["count"]
@@ -363,6 +399,9 @@ def main():
         l = data["losses"]
         rating = data["latest_rating"]
         ts = data["last_played_ts"]
+        acc_cnt = data["accuracy_count"]
+        acc_sum = data["accuracy_sum"]
+        total_acc_count += acc_cnt
 
         if count > 0 and rating is not None:
             dt_str = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime(
@@ -373,15 +412,25 @@ def main():
             score_pct = ((w + 0.5 * d) / count) * 100.0
             score_str = f"{score_pct:>5.1f}%"
             active_categories[cat] = rating
+
+            if acc_cnt >= MIN_ANALYZED_THRESHOLD:
+                avg_acc = acc_sum / acc_cnt
+                acc_display = f"{avg_acc:>5.1f}% ({acc_cnt:>4}/{count:<5})"
+            elif acc_cnt > 0:
+                avg_acc = acc_sum / acc_cnt
+                acc_display = f"{avg_acc:>5.1f}%*({acc_cnt:>2}/{count:<5})"
+            else:
+                acc_display = f"  N/A  (   0/{count:<5})"
         else:
             dt_str = "N/A"
             rating_str = "N/A"
             wdl_str = "N/A"
             score_str = "N/A"
+            acc_display = "N/A"
 
-        print(f"{cat.capitalize():<10} | {count:<8} | {wdl_str:<15} | {score_str:<9} | {rating_str:<8} | {dt_str:<20}", flush=True)
+        print(f"{cat.capitalize():<10} | {count:<8} | {wdl_str:<15} | {score_str:<9} | {acc_display:<22} | {rating_str:<8} | {dt_str:<20}", flush=True)
 
-    print("-" * 88, flush=True)
+    print("-" * 102, flush=True)
 
     if len(active_categories) >= 2:
         highest_cat = max(active_categories, key=active_categories.get)
@@ -399,12 +448,12 @@ def main():
     else:
         print("No rated games found in bullet, blitz, rapid, or daily categories.", flush=True)
 
-    print("=" * 88, flush=True)
+    print("=" * 102, flush=True)
 
     # Section 2: Chronological Short-Ply Streak Detection
-    print(f"\n" + "=" * 88, flush=True)
+    print(f"\n" + "=" * 102, flush=True)
     print(f" SUSPICIOUS SHORT-PLY STREAKS (0 < Ply <= {max_ply}, >= {min_streak} Consecutive Games)", flush=True)
-    print("=" * 88, flush=True)
+    print("=" * 102, flush=True)
 
     streaks = []
     current_streak = []
@@ -431,21 +480,57 @@ def main():
             end_dt = datetime.datetime.fromtimestamp(streak[-1]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
             print(f"\n[Streak #{idx}] Length: {len(streak)} games (+{wins} -{losses} ={draws}) | {start_dt} to {end_dt} UTC", flush=True)
-            print("-" * 88, flush=True)
+            print("-" * 102, flush=True)
             for g in streak:
                 dt_str = datetime.datetime.fromtimestamp(g["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 matchup_info = f"vs {g['opponent']} ({g['player_rating']}/{g['opponent_rating']})"
                 print(f"  [{g['outcome']:<4}] {g['time_class'].capitalize():<6} | {g['ply']:>2} ply | {g['event_type']:<7} | {matchup_info:<30} | {dt_str} UTC | {g['url']}", flush=True)
 
-    # Section 3: Rating Trajectory, Dormancy & Surge Analysis
-    print(f"\n" + "=" * 88, flush=True)
-    print(" RATING TRAJECTORY, DORMANCY & SURGE ANALYSIS", flush=True)
-    print("=" * 88, flush=True)
+    # Section 3: High-Accuracy Streak Detection
+    print(f"\n" + "=" * 102, flush=True)
+    print(f" HIGH-ACCURACY STREAKS (>= {args.acc_threshold:.1f}% Acc, >= {args.acc_min_ply} Ply, >= {args.acc_min_streak} Strictly Consecutive Games)", flush=True)
+    print("=" * 102, flush=True)
 
-    # 3A: Initial Account Onboarding
-    print(f"\n-- INITIAL ACCOUNT ONBOARDING (First {onboarding_limit} Games per Pool) " + "-" * max(0, (88 - len(f"-- INITIAL ACCOUNT ONBOARDING (First {onboarding_limit} Games per Pool) "))), flush=True)
+    acc_streaks = []
+    for cat in TARGET_CATEGORIES:
+        games = category_games[cat]
+        current_acc_streak = []
+        for g in games:
+            if g["accuracy"] is not None and g["accuracy"] >= args.acc_threshold and g["ply"] >= args.acc_min_ply:
+                current_acc_streak.append(g)
+            else:
+                if len(current_acc_streak) >= args.acc_min_streak:
+                    acc_streaks.append(list(current_acc_streak))
+                current_acc_streak = []
+        if len(current_acc_streak) >= args.acc_min_streak:
+            acc_streaks.append(list(current_acc_streak))
+
+    if not acc_streaks:
+        print(f"No strictly consecutive streaks of >= {args.acc_min_streak} high-accuracy games detected.", flush=True)
+    else:
+        for idx, streak in enumerate(acc_streaks, start=1):
+            avg_acc = sum(g["accuracy"] for g in streak) / len(streak)
+            peak_acc = max(g["accuracy"] for g in streak)
+            cat_name = streak[0]["time_class"].capitalize()
+            start_dt = datetime.datetime.fromtimestamp(streak[0]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            end_dt = datetime.datetime.fromtimestamp(streak[-1]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+            print(f"\n[Acc Streak #{idx}] {cat_name} | {len(streak)} games (Avg Acc: {avg_acc:.1f}%, Peak: {peak_acc:.1f}%) | {start_dt} to {end_dt} UTC", flush=True)
+            print("-" * 102, flush=True)
+            for g in streak:
+                dt_str = datetime.datetime.fromtimestamp(g["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                matchup_info = f"vs {g['opponent']} ({g['player_rating']}/{g['opponent_rating']})"
+                print(f"  [{g['outcome']:<4}] {g['time_class'].capitalize():<6} | {g['ply']:>2} ply | {g['accuracy']:>5.1f}% acc | {matchup_info:<30} | {dt_str} UTC | {g['url']}", flush=True)
+
+    # Section 4: Rating Trajectory, Dormancy & Surge Analysis
+    print(f"\n" + "=" * 102, flush=True)
+    print(" RATING TRAJECTORY, DORMANCY & SURGE ANALYSIS", flush=True)
+    print("=" * 102, flush=True)
+
+    # 4A: Initial Account Onboarding
+    print(f"\n-- INITIAL ACCOUNT ONBOARDING (First {onboarding_limit} Games per Pool) " + "-" * max(0, (102 - len(f"-- INITIAL ACCOUNT ONBOARDING (First {onboarding_limit} Games per Pool) "))), flush=True)
     print(f"{'Category':<10} | {'Initial -> End':<19} | {'Delta':<8} | {'Win Rate':<9} | {'Max Streak':<11} | {'Avg Opponent':<12}", flush=True)
-    print("-" * 88, flush=True)
+    print("-" * 102, flush=True)
 
     for cat in TARGET_CATEGORIES:
         games = category_games[cat]
@@ -478,12 +563,12 @@ def main():
         rating_range_str = f"{init_rating} -> {final_rating} (#{sample_count})"
         print(f"{cat.capitalize():<10} | {rating_range_str:<19} | {delta_str:<8} | {win_rate:>5.1f}%   | {str(max_streak_len) + ' games':<11} | {round(avg_opp):<12}", flush=True)
 
-    print("-" * 88, flush=True)
+    print("-" * 102, flush=True)
 
-    # 3B: Inactivity & Dormancy Gaps
-    print(f"\n-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) " + "-" * max(0, (88 - len(f"-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) "))), flush=True)
+    # 4B: Inactivity & Dormancy Gaps
+    print(f"\n-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) " + "-" * max(0, (102 - len(f"-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) "))), flush=True)
     print(f"{'Category':<10} | {'Inactive Period (UTC)':<25} | {'Duration':<11} | {'Tier':<10} | {f'Return Trajectory (First {return_sample_games} Games)':<30}", flush=True)
-    print("-" * 88, flush=True)
+    print("-" * 102, flush=True)
 
     dormancy_events = []
     for cat in TARGET_CATEGORIES:
@@ -536,11 +621,11 @@ def main():
 
     if not dormancy_events:
         print(f"No inactivity gaps >= {args.dormancy_days} days detected.", flush=True)
-    print("-" * 88, flush=True)
+    print("-" * 102, flush=True)
 
-    # 3C: High-Velocity Surge Windows
+    # 4C: High-Velocity Surge Windows
     surge_criteria_str = f"-- HIGH-VELOCITY SURGES (Gain >= +{args.surge_min_pts} pts, >= {args.surge_min_games} games, <= {args.surge_max_days}d, >= {args.surge_min_velocity} pts/d, >= {args.surge_min_winrate}% WR) "
-    print(f"\n{surge_criteria_str}" + "-" * max(0, 88 - len(surge_criteria_str)), flush=True)
+    print(f"\n{surge_criteria_str}" + "-" * max(0, 102 - len(surge_criteria_str)), flush=True)
 
     surges = []
     for cat in TARGET_CATEGORIES:
@@ -580,6 +665,12 @@ def main():
 
                         pace_game = gain / (len(window_games) - 1)
 
+                        # Accuracy calculation within surge window
+                        analyzed_in_window = [g["accuracy"] for g in window_games if g["accuracy"] is not None]
+                        acc_window_count = len(analyzed_in_window)
+                        acc_coverage_pct = (acc_window_count / len(window_games)) * 100.0 if window_games else 0.0
+                        avg_window_acc = sum(analyzed_in_window) / acc_window_count if acc_window_count > 0 else None
+
                         # Check if surge began immediately post-dormancy
                         reactivation_info = None
                         for d in dormancy_events:
@@ -607,6 +698,9 @@ def main():
                             "end_game": end_g,
                             "window_games": window_games,
                             "reactivation": reactivation_info,
+                            "acc_count": acc_window_count,
+                            "acc_coverage": acc_coverage_pct,
+                            "avg_acc": avg_window_acc,
                         })
 
     # Deduplicate overlapping surge windows by selecting the maximum gain window
@@ -635,41 +729,57 @@ def main():
             min_opp = min(opp_ratings) if opp_ratings else 0
             max_opp = max(opp_ratings) if opp_ratings else 0
 
+            acc_info_str = f"Avg Acc: {s['avg_acc']:.1f}% ({s['acc_count']}/{s['game_count']} analyzed, {s['acc_coverage']:.0f}% coverage)" if s["avg_acc"] is not None else "Avg Acc: N/A (0 analyzed)"
+
             print(f"\n[Surge #{idx}] {s['category'].capitalize()} | +{s['gain']} pts ({s['start_rating']} -> {s['end_rating']}) over {s['game_count']} games | {days_str}", flush=True)
             print(f"Record: {s['wins']} Wins, {s['losses']} Losses, {s['draws']} Draws ({s['win_rate']:.1f}% Win Rate) | Pace: +{s['pace_game']:.1f} pts/game (+{s['pace_day']:.1f} pts/day)", flush=True)
+            print(f"Review: {acc_info_str}", flush=True)
 
             if s["reactivation"]:
                 gap_d = s["reactivation"]["gap_days"]
                 tier_str = s["reactivation"]["tier"]
                 print(f"Alert : REACTIVATION SURGE -> Surge began immediately after {gap_d} days of {tier_str.lower()} dormancy!", flush=True)
 
-            print("-" * 88, flush=True)
+            print("-" * 102, flush=True)
             print(f"  Start Match : {s['start_rating']} vs {s['start_game']['opponent']} ({s['start_game']['opponent_rating']}) | {start_dt} UTC", flush=True)
             print(f"  Peak Match  : {s['end_rating']} vs {s['end_game']['opponent']} ({s['end_game']['opponent_rating']}) | {end_dt} UTC", flush=True)
             print(f"  Opponents   : Avg {round(avg_opp)} rating (Min: {min_opp}, Max: {max_opp})", flush=True)
 
-    # Section 4: Forensic Synthesis & Verdict Determination
+    # Section 5: Forensic Synthesis & Verdict Determination
     reasons = []
     signals_smoke = []
     signals_fire = []
 
-    # Check for Fire-level conditions (sustained engine-level thresholds)
+    # Check for Fire-level conditions
     for s in filtered_surges:
-        if s["reactivation"] and s["pace_day"] >= 25.0 and s["win_rate"] >= 80.0:
+        # Surge with high accuracy corroboration
+        if s["avg_acc"] is not None and s["acc_count"] >= 5 and s["acc_coverage"] >= 30.0 and s["avg_acc"] >= 93.0:
+            signals_fire.append(f"High-velocity surge corroborated by extreme accuracy (+{s['gain']} pts, {s['win_rate']:.1f}% WR, {s['avg_acc']:.1f}% avg acc across {s['acc_count']} games)")
+        elif s["reactivation"] and s["pace_day"] >= 25.0 and s["win_rate"] >= 80.0:
             signals_fire.append(f"Reactivation surge (+{s['gain']} pts, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day post-dormancy)")
         elif s["gain"] >= 200 and s["days"] <= 7.0 and s["pace_day"] >= 35.0 and s["win_rate"] >= 85.0:
             signals_fire.append(f"High-velocity surge (+{s['gain']} pts in {s['days']:.1f}d at +{s['pace_day']:.1f} pts/day, {s['win_rate']:.1f}% win rate)")
+
+    for a_streak in acc_streaks:
+        if len(a_streak) >= 4:
+            avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
+            signals_fire.append(f"Extensive high-accuracy streak ({len(a_streak)} consecutive games, avg {avg_a:.1f}% acc)")
 
     total_short_games = sum(len(st) for st in streaks)
     max_streak_len = max([len(st) for st in streaks]) if streaks else 0
     if max_streak_len >= 5 or total_short_games >= 12:
         signals_fire.append(f"Severe short-ply streaks (Max: {max_streak_len} consecutive games, Total: {total_short_games})")
 
-    # Check for Smoke-level conditions (isolated heaters or borderline patterns)
+    # Check for Smoke-level conditions
     for s in filtered_surges:
         if s not in signals_fire:
             if 75.0 <= s["win_rate"] < 85.0 or s["pace_day"] >= 20.0:
                 signals_smoke.append(f"Elevated surge session (+{s['gain']} pts over {s['game_count']} games, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day)")
+
+    for a_streak in acc_streaks:
+        if len(a_streak) == 3 and not any("high-accuracy streak" in f for f in signals_fire):
+            avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
+            signals_smoke.append(f"High-accuracy streak ({len(a_streak)} consecutive games >= {args.acc_threshold:.1f}% acc, avg {avg_a:.1f}%)")
 
     if len(streaks) >= 2 and not signals_fire:
         signals_smoke.append(f"Multiple short-ply streaks detected ({len(streaks)} streaks)")
@@ -684,13 +794,25 @@ def main():
         verdict = "Human"
         reasons = ["Rating progression and volume profiles align with standard organic play."]
 
-    print("\n" + "=" * 88, flush=True)
+    print("\n" + "=" * 102, flush=True)
     print(" FINAL FORENSIC SYNTHESIS", flush=True)
-    print("=" * 88, flush=True)
+    print("=" * 102, flush=True)
     print(f" Verdict         : {verdict}", flush=True)
     print(f" Primary Signals :", flush=True)
     streak_summary = f"{len(streaks)} streaks found (Max: {max_streak_len} games, Total: {total_short_games} games)" if streaks else "None detected"
     print(f"   - [Short-Ply Streaks]   : {streak_summary}", flush=True)
+
+    if acc_streaks:
+        max_acc_len = max(len(st) for st in acc_streaks)
+        peak_acc_all = max(max(g["accuracy"] for g in st) for st in acc_streaks)
+        acc_signal_str = f"{len(acc_streaks)} streaks found (Max: {max_acc_len} games, Peak Acc: {peak_acc_all:.1f}%)"
+    else:
+        overall_acc_coverage = (total_acc_count / total_games_all) * 100.0 if total_games_all > 0 else 0.0
+        if total_acc_count < MIN_ANALYZED_THRESHOLD:
+            acc_signal_str = f"None detected (Sparse data: {total_acc_count}/{total_games_all} analyzed - {overall_acc_coverage:.1f}% coverage)"
+        else:
+            acc_signal_str = f"None detected ({total_acc_count}/{total_games_all} analyzed - {overall_acc_coverage:.1f}% coverage)"
+    print(f"   - [Accuracy Profile]    : {acc_signal_str}", flush=True)
 
     ext_gaps = [d for d in dormancy_events if d["tier"] == "Extended"]
     max_gap_days = max([d["gap_days"] for d in dormancy_events]) if dormancy_events else 0
@@ -701,7 +823,7 @@ def main():
     print(f" Evaluation Details:", flush=True)
     for r in reasons:
         print(f"   * {r}", flush=True)
-    print("=" * 88 + "\n", flush=True)
+    print("=" * 102 + "\n", flush=True)
 
 
 if __name__ == "__main__":
