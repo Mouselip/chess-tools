@@ -26,11 +26,12 @@
 #   regardless of opponent to identify rating farming, sandbagging, or
 #   rapid rating dumping with event categorization and dual player/opponent
 #   ratings. Evaluates rating trajectories by categorizing dormancy gaps
-#   into standard (>= 30 days) and extended (>= 90 days) tiers, and flags
-#   high-density, rapid rating surges bounded strictly by calendar time,
-#   minimum game volume, and daily velocity.
+#   into standard (>= 30 days) and extended (>= 90 days) tiers with return
+#   session trajectory tracking (first 5 games back), and flags high-density,
+#   rapid rating surges bounded strictly by calendar time, minimum game volume,
+#   and daily velocity.
 #
-# Version: v0.0.10
+# Version: v0.0.11
 
 import argparse
 import datetime
@@ -41,13 +42,14 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.0.10 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.0.11 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid")
 DEFAULT_MAX_PLY = 13
 DEFAULT_MIN_STREAK = 3
 DEFAULT_ONBOARDING_GAMES = 30
+DEFAULT_RETURN_SAMPLE_GAMES = 5
 
 # Inactivity defaults
 DEFAULT_STANDARD_DORMANCY_DAYS = 30
@@ -147,6 +149,12 @@ def main():
         help=f"Minimum days of inactivity for extended dormancy (default: {DEFAULT_EXTENDED_DORMANCY_DAYS})",
     )
     parser.add_argument(
+        "--return-games",
+        type=int,
+        default=DEFAULT_RETURN_SAMPLE_GAMES,
+        help=f"Number of games to sample immediately upon return from dormancy (default: {DEFAULT_RETURN_SAMPLE_GAMES})",
+    )
+    parser.add_argument(
         "--surge-min-pts",
         type=int,
         default=DEFAULT_SURGE_MIN_PTS,
@@ -177,6 +185,7 @@ def main():
     max_ply = args.max_ply
     min_streak = args.min_streak
     onboarding_limit = args.onboarding_games
+    return_sample_games = args.return_games
     dormancy_sec = args.dormancy_days * 86400
     ext_dormancy_sec = args.extended_dormancy_days * 86400
 
@@ -286,11 +295,11 @@ def main():
         category_games[cat].sort(key=lambda g: g["end_time"])
 
     # Section 1: Rating Summary Output
-    print("\n" + "=" * 78)
+    print("\n" + "=" * 88)
     print(f" RATED RATING SUMMARY: {username}")
-    print("=" * 78)
+    print("=" * 88)
     print(f"{'Category':<10} | {'Games':<8} | {'Rating':<8} | {'Last Played (UTC)':<20}")
-    print("-" * 78)
+    print("-" * 88)
 
     active_categories = {}
     for cat in TARGET_CATEGORIES:
@@ -311,7 +320,7 @@ def main():
 
         print(f"{cat.capitalize():<10} | {count:<8} | {rating_str:<8} | {dt_str:<20}")
 
-    print("-" * 78)
+    print("-" * 88)
 
     if len(active_categories) >= 2:
         highest_cat = max(active_categories, key=active_categories.get)
@@ -329,12 +338,12 @@ def main():
     else:
         print("No rated games found in bullet, blitz, or rapid categories.")
 
-    print("=" * 78)
+    print("=" * 88)
 
     # Section 2: Chronological Short-Ply Streak Detection
-    print(f"\n" + "=" * 78)
+    print(f"\n" + "=" * 88)
     print(f" SUSPICIOUS SHORT-PLY STREAKS (0 < Ply <= {max_ply}, >= {min_streak} Consecutive Games)")
-    print("=" * 78)
+    print("=" * 88)
 
     streaks = []
     current_streak = []
@@ -361,21 +370,21 @@ def main():
             end_dt = datetime.datetime.fromtimestamp(streak[-1]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
             print(f"\n[Streak #{idx}] Length: {len(streak)} games (+{wins} -{losses} ={draws}) | {start_dt} to {end_dt} UTC")
-            print("-" * 78)
+            print("-" * 88)
             for g in streak:
                 dt_str = datetime.datetime.fromtimestamp(g["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 matchup_info = f"vs {g['opponent']} ({g['player_rating']}/{g['opponent_rating']})"
                 print(f"  [{g['outcome']:<4}] {g['time_class'].capitalize():<6} | {g['ply']:>2} ply | {g['event_type']:<7} | {matchup_info:<30} | {dt_str} UTC | {g['url']}")
 
     # Section 3: Rating Trajectory, Dormancy & Surge Analysis
-    print(f"\n" + "=" * 78)
+    print(f"\n" + "=" * 88)
     print(" RATING TRAJECTORY, DORMANCY & SURGE ANALYSIS")
-    print("=" * 78)
+    print("=" * 88)
 
     # 3A: Initial Account Onboarding
-    print(f"\n-- INITIAL ACCOUNT ONBOARDING (First {onboarding_limit} Games per Pool) " + "-" * (78 - len(f"-- INITIAL ACCOUNT ONBOARDING (First {onboarding_limit} Games per Pool) ")))
+    print(f"\n-- INITIAL ACCOUNT ONBOARDING (First {onboarding_limit} Games per Pool) " + "-" * max(0, (88 - len(f"-- INITIAL ACCOUNT ONBOARDING (First {onboarding_limit} Games per Pool) "))))
     print(f"{'Category':<10} | {'Initial -> End':<19} | {'Delta':<8} | {'Win Rate':<9} | {'Max Streak':<11} | {'Avg Opponent':<12}")
-    print("-" * 78)
+    print("-" * 88)
 
     for cat in TARGET_CATEGORIES:
         games = category_games[cat]
@@ -408,12 +417,12 @@ def main():
         rating_range_str = f"{init_rating} -> {final_rating} (#{sample_count})"
         print(f"{cat.capitalize():<10} | {rating_range_str:<19} | {delta_str:<8} | {win_rate:>5.1f}%   | {str(max_streak_len) + ' games':<11} | {round(avg_opp):<12}")
 
-    print("-" * 78)
+    print("-" * 88)
 
     # 3B: Inactivity & Dormancy Gaps
-    print(f"\n-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) " + "-" * (78 - len(f"-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) ")))
-    print(f"{'Category':<10} | {'Inactive Period (UTC)':<25} | {'Duration':<11} | {'Tier':<10} | {'Pre -> Post':<13}")
-    print("-" * 78)
+    print(f"\n-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) " + "-" * max(0, (88 - len(f"-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) "))))
+    print(f"{'Category':<10} | {'Inactive Period (UTC)':<25} | {'Duration':<11} | {'Tier':<10} | {f'Return Trajectory (First {return_sample_games} Games)':<30}")
+    print("-" * 88)
 
     dormancy_events = []
     for cat in TARGET_CATEGORIES:
@@ -432,7 +441,23 @@ def main():
                 d_start = datetime.datetime.fromtimestamp(g_prev["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
                 d_end = datetime.datetime.fromtimestamp(g_next["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
                 period_str = f"{d_start} -> {d_end}"
-                rating_str = f"{g_prev['player_rating']} -> {g_next['player_rating']}"
+
+                # Sample the return cluster (up to return_sample_games)
+                return_sample = games[i + 1: i + 1 + return_sample_games]
+                sample_len = len(return_sample)
+                pre_rating = g_prev["player_rating"]
+                post_sample_rating = return_sample[-1]["player_rating"]
+                sample_delta = post_sample_rating - pre_rating
+                s_wins = sum(1 for g in return_sample if g["outcome"] == "WIN")
+                s_losses = sum(1 for g in return_sample if g["outcome"] == "LOSS")
+                s_draws = sum(1 for g in return_sample if g["outcome"] == "DRAW")
+
+                delta_str = f"{sample_delta:+d}"
+                record_str = f"{s_wins}-{s_losses}-{s_draws}"
+                if sample_len == 1:
+                    trajectory_str = f"{pre_rating} -> {post_sample_rating} ({delta_str} pts, 1 gm: {record_str})"
+                else:
+                    trajectory_str = f"{pre_rating} -> {post_sample_rating} ({delta_str} pts, {record_str})"
 
                 dormancy_events.append({
                     "category": cat,
@@ -442,18 +467,18 @@ def main():
                     "pre_time": g_prev["end_time"],
                     "post_time": g_next["end_time"],
                     "post_game_index": i + 1,
-                    "pre_rating": g_prev["player_rating"],
+                    "pre_rating": pre_rating,
                     "post_rating": g_next["player_rating"],
                 })
-                print(f"{cat.capitalize():<10} | {period_str:<25} | {str(gap_days) + ' days':<11} | {tier:<10} | {rating_str:<13}")
+                print(f"{cat.capitalize():<10} | {period_str:<25} | {str(gap_days) + ' days':<11} | {tier:<10} | {trajectory_str:<30}")
 
     if not dormancy_events:
         print(f"No inactivity gaps >= {args.dormancy_days} days detected.")
-    print("-" * 78)
+    print("-" * 88)
 
     # 3C: High-Velocity Surge Windows
     surge_criteria_str = f"-- HIGH-VELOCITY SURGES (Gain >= +{args.surge_min_pts} pts, >= {args.surge_min_games} games, <= {args.surge_max_days}d, >= {args.surge_min_velocity} pts/d) "
-    print(f"\n{surge_criteria_str}" + "-" * max(0, 78 - len(surge_criteria_str)))
+    print(f"\n{surge_criteria_str}" + "-" * max(0, 88 - len(surge_criteria_str)))
 
     surges = []
     for cat in TARGET_CATEGORIES:
@@ -545,12 +570,12 @@ def main():
                 tier_str = s["reactivation"]["tier"]
                 print(f"Alert : REACTIVATION SURGE -> Surge began immediately after {gap_d} days of {tier_str.lower()} dormancy!")
 
-            print("-" * 78)
+            print("-" * 88)
             print(f"  Start Match : {s['start_rating']} vs {s['start_game']['opponent']} ({s['start_game']['opponent_rating']}) | {start_dt} UTC")
             print(f"  Peak Match  : {s['end_rating']} vs {s['end_game']['opponent']} ({s['end_game']['opponent_rating']}) | {end_dt} UTC")
             print(f"  Opponents   : Avg {round(avg_opp)} rating (Min: {min_opp}, Max: {max_opp})")
 
-    print("\n" + "=" * 78 + "\n")
+    print("\n" + "=" * 88 + "\n")
 
 
 if __name__ == "__main__":
