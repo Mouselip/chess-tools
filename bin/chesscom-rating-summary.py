@@ -18,17 +18,16 @@
 #
 # Description:
 #   Scans the Chess.com public archives for a target player, filtering
-#   for rated games in the bullet, blitz, and rapid categories. Reports
-#   game counts, latest rating, and last played date per category, and
-#   calculates the rating spread between the highest and lowest categories.
-#   Additionally inspects the archive for suspicious short-ply games
-#   (<= 4 ply / 2 full moves) to detect potential rating farming or dumping
-#   involving repeated patterns (>= 3 short games) against the same opponent.
+#   for rated games in bullet, blitz, and rapid categories. Reports
+#   game counts, latest rating, last played date per category, and the
+#   rating spread between highest and lowest categories. Additionally
+#   detects suspicious streaks of consecutive short-ply games (<= 3 ply)
+#   regardless of opponent to identify rating farming, sandbagging, or
+#   rapid rating dumping.
 #
-# Version: v0.0.3
+# Version: v0.0.4
 
 import argparse
-import collections
 import datetime
 import json
 import re
@@ -37,12 +36,12 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.0.3 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.0.4 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid")
-MAX_PLY_THRESHOLD = 4
-MIN_REPEATS_THRESHOLD = 3
+DEFAULT_MAX_PLY = 3
+DEFAULT_MIN_STREAK = 3
 
 
 def fetch_json(url):
@@ -84,27 +83,27 @@ def count_ply_from_pgn(pgn_str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scan Chess.com archives for rated games, rating summaries, and suspicious short-ply patterns."
+        description="Scan Chess.com archives for rated games, rating summaries, and consecutive short-ply streaks."
     )
     parser.add_argument("username", help="Chess.com target username")
     parser.add_argument(
         "--max-ply",
         type=int,
-        default=MAX_PLY_THRESHOLD,
-        help=f"Maximum ply threshold for short-game detection (default: {MAX_PLY_THRESHOLD})",
+        default=DEFAULT_MAX_PLY,
+        help=f"Maximum ply threshold for short-game detection (default: {DEFAULT_MAX_PLY})",
     )
     parser.add_argument(
-        "--min-repeats",
+        "--min-streak",
         type=int,
-        default=MIN_REPEATS_THRESHOLD,
-        help=f"Minimum short-game encounters against an opponent to report (default: {MIN_REPEATS_THRESHOLD})",
+        default=DEFAULT_MIN_STREAK,
+        help=f"Minimum consecutive short games to flag as a streak (default: {DEFAULT_MIN_STREAK})",
     )
     args = parser.parse_args()
 
     username = args.username.strip()
     username_lower = username.lower()
     max_ply = args.max_ply
-    min_repeats = args.min_repeats
+    min_streak = args.min_streak
 
     archives_url = f"https://api.chess.com/pub/player/{username_lower}/games/archives"
     archives_data = fetch_json(archives_url)
@@ -127,8 +126,7 @@ def main():
         for cat in TARGET_CATEGORIES
     }
 
-    # Tracking short games: { opponent_username: { "wins": [details], "losses": [details], "draws": [details] } }
-    short_game_tracker = collections.defaultdict(lambda: {"wins": [], "losses": [], "draws": []})
+    all_rated_games = []
 
     total_months = len(archive_urls)
     print(f"[*] Scanning {total_months} monthly archives for '{username}'...")
@@ -157,44 +155,53 @@ def main():
                 player_rating = white.get("rating")
                 player_result = white.get("result", "")
                 opponent_name = black_user
+                opponent_rating = black.get("rating")
             elif black_lower == username_lower:
                 player_color = "black"
                 player_rating = black.get("rating")
                 player_result = black.get("result", "")
                 opponent_name = white_user
+                opponent_rating = white.get("rating")
             else:
                 continue
 
             end_time = game.get("end_time", 0)
 
-            # Rating category tracking
+            # Category stats tracking
             if time_class in stats:
                 stats[time_class]["count"] += 1
                 if end_time >= stats[time_class]["last_played_ts"]:
                     stats[time_class]["last_played_ts"] = end_time
                     stats[time_class]["latest_rating"] = player_rating
 
-            # Short ply analysis
+            # Collect game metadata for sequential streak analysis
             pgn = game.get("pgn", "")
             ply_count = count_ply_from_pgn(pgn)
+            game_url = game.get("url", "")
 
-            if ply_count <= max_ply:
-                game_url = game.get("url", "")
-                entry = {
-                    "time_class": time_class,
-                    "ply": ply_count,
-                    "end_time": end_time,
-                    "url": game_url,
-                    "color": player_color,
-                }
-                if player_result == "win":
-                    short_game_tracker[opponent_name]["wins"].append(entry)
-                elif player_result in ("agreed", "repetition", "stalemate", "timevsinsufficient", "insufficient"):
-                    short_game_tracker[opponent_name]["draws"].append(entry)
-                else:
-                    short_game_tracker[opponent_name]["losses"].append(entry)
+            if player_result == "win":
+                outcome = "WIN"
+            elif player_result in ("agreed", "repetition", "stalemate", "timevsinsufficient", "insufficient"):
+                outcome = "DRAW"
+            else:
+                outcome = "LOSS"
 
-    # Section 1: Rating Summary
+            all_rated_games.append({
+                "end_time": end_time,
+                "time_class": time_class,
+                "ply": ply_count,
+                "outcome": outcome,
+                "color": player_color,
+                "opponent": opponent_name,
+                "opponent_rating": opponent_rating,
+                "rating": player_rating,
+                "url": game_url,
+            })
+
+    # Sort chronologically by end_time
+    all_rated_games.sort(key=lambda g: g["end_time"])
+
+    # Section 1: Rating Summary Output
     print("\n" + "=" * 62)
     print(f" RATED RATING SUMMARY: {username}")
     print("=" * 62)
@@ -240,28 +247,42 @@ def main():
 
     print("=" * 62)
 
-    # Section 2: Short-Ply Pairing Analysis
+    # Section 2: Chronological Short-Ply Streak Detection
     print(f"\n" + "=" * 62)
-    print(f" SUSPICIOUS SHORT-PLY REPORT (<= {max_ply} Ply, >= {min_repeats} Games)")
+    print(f" SUSPICIOUS SHORT-PLY STREAKS (<= {max_ply} Ply, >= {min_streak} Consecutive Games)")
     print("=" * 62)
 
-    flagged_opponents = 0
+    streaks = []
+    current_streak = []
 
-    for opponent, records in short_game_tracker.items():
-        total_short = len(records["wins"]) + len(records["losses"]) + len(records["draws"])
-        if total_short >= min_repeats:
-            flagged_opponents += 1
-            print(f"\nOpponent: {opponent}")
-            print(f"Total Short Games (<= {max_ply} ply): {total_short} (Wins: {len(records['wins'])}, Losses: {len(records['losses'])}, Draws: {len(records['draws'])})")
+    for game in all_rated_games:
+        if game["ply"] <= max_ply:
+            current_streak.append(game)
+        else:
+            if len(current_streak) >= min_streak:
+                streaks.append(list(current_streak))
+            current_streak = []
+
+    if len(current_streak) >= min_streak:
+        streaks.append(list(current_streak))
+
+    if not streaks:
+        print(f"No consecutive streaks of >= {min_streak} short-ply games detected.")
+    else:
+        for idx, streak in enumerate(streaks, start=1):
+            wins = sum(1 for g in streak if g["outcome"] == "WIN")
+            losses = sum(1 for g in streak if g["outcome"] == "LOSS")
+            draws = sum(1 for g in streak if g["outcome"] == "DRAW")
+            start_dt = datetime.datetime.fromtimestamp(streak[0]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            end_dt = datetime.datetime.fromtimestamp(streak[-1]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+            print(f"\n[Streak #{idx}] Length: {len(streak)} games | {start_dt} to {end_dt} UTC")
+            print(f"Breakdown: {wins} Wins, {losses} Losses, {draws} Draws")
             print("-" * 62)
-
-            for outcome, label in (("wins", "WIN"), ("losses", "LOSS"), ("draws", "DRAW")):
-                for g in records[outcome]:
-                    dt_str = datetime.datetime.fromtimestamp(g["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"  [{label:<4}] {g['time_class'].capitalize():<6} | {g['ply']} ply | Played {g['color'].capitalize():<5} | {dt_str} UTC | {g['url']}")
-
-    if flagged_opponents == 0:
-        print(f"No repeated short-ply patterns detected against the same opponent (>= {min_repeats} games).")
+            for g in streak:
+                dt_str = datetime.datetime.fromtimestamp(g["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                opp_info = f"{g['opponent']} ({g['opponent_rating']})"
+                print(f"  [{g['outcome']:<4}] {g['time_class'].capitalize():<6} | {g['ply']} ply | vs {opp_info:<22} | {dt_str} UTC | {g['url']}")
 
     print("\n" + "=" * 62 + "\n")
 
