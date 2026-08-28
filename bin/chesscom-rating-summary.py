@@ -31,9 +31,9 @@
 #   rapid rating surges bounded strictly by calendar time, minimum game volume,
 #   and daily velocity, while ignoring natural account onboarding calibration.
 #   Concludes with a synthesized verdict (Human, Smoke, or Fire) evaluating
-#   fair-play risk with time-bounded return checks.
+#   fair-play risk based strictly on sustained game volume and macro surges.
 #
-# Version: v0.0.15
+# Version: v0.0.16
 
 import argparse
 import datetime
@@ -44,7 +44,7 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.0.15 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.0.16 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid")
@@ -471,7 +471,6 @@ def main():
                 pre_rating = g_prev["player_rating"]
                 post_sample_rating = return_sample[-1]["player_rating"]
                 sample_delta = post_sample_rating - pre_rating
-                sample_duration_days = (return_sample[-1]["end_time"] - return_sample[0]["end_time"]) / 86400.0 if sample_len > 1 else 0.0
 
                 s_wins = sum(1 for g in return_sample if g["outcome"] == "WIN")
                 s_losses = sum(1 for g in return_sample if g["outcome"] == "LOSS")
@@ -494,10 +493,6 @@ def main():
                     "post_game_index": i + 1,
                     "pre_rating": pre_rating,
                     "post_rating": g_next["player_rating"],
-                    "sample_delta": sample_delta,
-                    "sample_days": sample_duration_days,
-                    "sample_len": sample_len,
-                    "return_record": (s_wins, s_losses, s_draws),
                 })
                 print(f"{cat.capitalize():<10} | {period_str:<25} | {str(gap_days) + ' days':<11} | {tier:<10} | {trajectory_str:<30}", flush=True)
 
@@ -516,7 +511,7 @@ def main():
         if n_games < args.surge_min_games:
             continue
 
-        # Ignore candidate surge starting within initial onboarding window
+        # Ignore candidate surges starting within initial onboarding window
         start_bound = max(0, args.surge_ignore_onboarding)
         for i in range(start_bound, n_games):
             start_g = games[i]
@@ -607,7 +602,6 @@ def main():
             print(f"  Opponents   : Avg {round(avg_opp)} rating (Min: {min_opp}, Max: {max_opp})", flush=True)
 
     # Section 4: Forensic Synthesis & Verdict Determination
-    verdict = "Human"
     reasons = []
     signals_smoke = []
     signals_fire = []
@@ -632,15 +626,6 @@ def main():
 
     if len(streaks) >= 2 and not signals_fire:
         signals_smoke.append(f"Multiple short-ply streaks detected ({len(streaks)} streaks)")
-
-    # Post-dormancy gains: Must be rapid (<= 7 days) and high win-rate to trigger Smoke
-    for d in dormancy_events:
-        if d["sample_delta"] >= 100 and d["sample_days"] <= 7.0:
-            w, l, dr = d["return_record"]
-            total_g = w + l + dr
-            wr = (w / total_g) * 100.0 if total_g > 0 else 0.0
-            if wr >= 80.0:
-                signals_smoke.append(f"Rapid post-dormancy burst (+{d['sample_delta']} pts in {d['sample_days']:.1f}d, {wr:.0f}% win rate)")
 
     if signals_fire:
         verdict = "Fire"
