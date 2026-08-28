@@ -19,9 +19,10 @@
 #
 # Description:
 #   Scans the Chess.com public archives for a target player, filtering
-#   for rated games in bullet, blitz, and rapid categories. Reports
-#   game counts, latest rating, last played date per category, and the
-#   rating spread between highest and lowest categories. Detects
+#   for rated games across bullet, blitz, rapid, and daily categories.
+#   Retrieves player profile metadata to report account status at the top.
+#   Reports game counts, latest rating, last played date per category, and
+#   the rating spread between highest and lowest categories. Detects
 #   suspicious streaks of consecutive short-ply games (0 < ply <= 13)
 #   regardless of opponent to identify rating farming, sandbagging, or
 #   rapid rating dumping with event categorization and dual player/opponent
@@ -32,9 +33,9 @@
 #   daily velocity, and anomalous win rate floors, filtering out high-volume
 #   speed-pool grinding and onboarding noise with normalized sub-day time clamping.
 #   Concludes with a graduated synthesized verdict (Human, Smoke, or Fire)
-#   evaluating fair-play risk without jumping straight over Smoke on isolated heaters.
+#   evaluating fair-play risk.
 #
-# Version: v0.0.18
+# Version: v0.1.0
 
 import argparse
 import datetime
@@ -45,10 +46,10 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.0.18 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.1.0 (Contact: GitHub/Mouselip)"
 }
 
-TARGET_CATEGORIES = ("bullet", "blitz", "rapid")
+TARGET_CATEGORIES = ("bullet", "blitz", "rapid", "daily")
 DEFAULT_MAX_PLY = 13
 DEFAULT_MIN_STREAK = 3
 DEFAULT_ONBOARDING_GAMES = 50
@@ -209,6 +210,16 @@ def main():
     dormancy_sec = args.dormancy_days * 86400
     ext_dormancy_sec = args.extended_dormancy_days * 86400
 
+    # Fetch user profile metadata for account status
+    profile_url = f"https://api.chess.com/pub/player/{username_lower}"
+    profile_data = fetch_json(profile_url)
+    if profile_data:
+        account_status = profile_data.get("status", "unknown")
+        player_title = profile_data.get("title", "")
+    else:
+        account_status = "unknown"
+        player_title = ""
+
     archives_url = f"https://api.chess.com/pub/player/{username_lower}/games/archives"
     archives_data = fetch_json(archives_url)
 
@@ -327,7 +338,8 @@ def main():
 
     # Section 1: Rating Summary Output
     print("=" * 88, flush=True)
-    print(f" RATED RATING SUMMARY: {username}", flush=True)
+    title_str = f" [{player_title}]" if player_title else ""
+    print(f" RATED RATING SUMMARY: {username}{title_str} | Status: {account_status}", flush=True)
     print("=" * 88, flush=True)
     print(f"{'Category':<10} | {'Games':<8} | {'Rating':<8} | {'Last Played (UTC)':<20}", flush=True)
     print("-" * 88, flush=True)
@@ -367,7 +379,7 @@ def main():
         cat, rating = next(iter(active_categories.items()))
         print(f"Only one active rated category found: {cat.capitalize()} ({rating}). Spread not applicable.", flush=True)
     else:
-        print("No rated games found in bullet, blitz, or rapid categories.", flush=True)
+        print("No rated games found in bullet, blitz, rapid, or daily categories.", flush=True)
 
     print("=" * 88, flush=True)
 
