@@ -23,9 +23,9 @@
 #   calculates the rating spread between the highest and lowest categories.
 #   Additionally inspects the archive for suspicious short-ply games
 #   (<= 4 ply / 2 full moves) to detect potential rating farming or dumping
-#   involving repeated wins or losses against the same opponent.
+#   involving repeated patterns (>= 3 short games) against the same opponent.
 #
-# Version: v0.0.2
+# Version: v0.0.3
 
 import argparse
 import collections
@@ -37,11 +37,12 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.0.2 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.0.3 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid")
 MAX_PLY_THRESHOLD = 4
+MIN_REPEATS_THRESHOLD = 3
 
 
 def fetch_json(url):
@@ -95,8 +96,8 @@ def main():
     parser.add_argument(
         "--min-repeats",
         type=int,
-        default=2,
-        help="Minimum short-game encounters against an opponent to report (default: 2)",
+        default=MIN_REPEATS_THRESHOLD,
+        help=f"Minimum short-game encounters against an opponent to report (default: {MIN_REPEATS_THRESHOLD})",
     )
     args = parser.parse_args()
 
@@ -241,7 +242,7 @@ def main():
 
     # Section 2: Short-Ply Pairing Analysis
     print(f"\n" + "=" * 62)
-    print(f" SUSPICIOUS SHORT-PLY REPORT (<= {max_ply} Ply)")
+    print(f" SUSPICIOUS SHORT-PLY REPORT (<= {max_ply} Ply, >= {min_repeats} Games)")
     print("=" * 62)
 
     flagged_opponents = 0
