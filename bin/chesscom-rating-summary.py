@@ -24,16 +24,17 @@
 #   and script version at the top of the report.
 #   Reports game counts, W-D-L records, overall score percentage, average
 #   accuracy with analysis coverage counts, latest rating, last played date
-#   per category, and rating spread. Detects suspicious streaks of consecutive
-#   short-ply games (0 < ply <= 13) and sustained high-accuracy winning streaks
-#   (accuracy >= 96.0%, ply >= 45, 100% wins, strictly consecutive and time-bounded
-#   within <= 48h, live categories only). Evaluates rating trajectories, dormancy
-#   gaps, and high-velocity surges with density-gated accuracy corroboration.
+#   per category, abandoned games with material deficit telemetry, and rating
+#   spread. Detects suspicious streaks of consecutive short-ply games
+#   (0 < ply <= 13) and sustained high-accuracy winning streaks (accuracy >= 96.0%,
+#   ply >= 45, 100% wins, strictly consecutive and time-bounded within <= 48h,
+#   live categories only). Evaluates rating trajectories, dormancy gaps, and
+#   high-velocity surges with density-gated accuracy corroboration.
 #   Synthesizes graduated verdicts (Human, Smoke, or Fire) with explicit category
 #   names, dates in evaluation details, clear trigger attribution, and pool breakdowns.
 #   Includes robust HTTP 429/transient retry backoff and an optional User-Agent CLI flag.
 #
-# Version: v1.0.0
+# Version: v1.1.0
 
 import argparse
 import datetime
@@ -44,7 +45,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "v1.0.0"
+VERSION = "v1.1.0"
 DEFAULT_REPO_URL = "https://github.com/Mouselip/chess-tools"
 
 # Pool and category filters
@@ -77,6 +78,12 @@ MIN_ACC_PLY = 45
 ACC_STREAK_THRESHOLD = 96.0
 ACC_STREAK_MAX_HOURS = 48.0
 MIN_ANALYZED_THRESHOLD = 10
+
+# Material piece values for FEN parsing
+PIECE_VALUES = {
+    'p': 1, 'n': 3, 'b': 3, 'r': 5, 'q': 9,
+    'P': 1, 'N': 3, 'B': 3, 'R': 5, 'Q': 9
+}
 
 
 def fetch_json(url, user_agent, max_retries=3):
@@ -148,6 +155,17 @@ def extract_event_type(pgn_str):
     return "Pool"
 
 
+def count_material_deficit(fen, is_white):
+    """Returns True if player is down 3 or more points of material on the board."""
+    if not fen:
+        return False
+    board_part = fen.split()[0]
+    white_score = sum(PIECE_VALUES[c] for c in board_part if c.isupper() and c in PIECE_VALUES)
+    black_score = sum(PIECE_VALUES[c] for c in board_part if c.islower() and c in PIECE_VALUES)
+    delta = (white_score - black_score) if is_white else (black_score - white_score)
+    return delta <= -3
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Scan Chess.com archives for rated games, summaries, short-ply streaks, accuracy winning streaks, dormancy gaps, and surges."
@@ -204,6 +222,8 @@ def main():
             "accuracy_count": 0,
             "latest_rating": None,
             "last_played_ts": 0,
+            "abandoned_total": 0,
+            "abandoned_deficit": 0,
         }
         for cat in TARGET_CATEGORIES
     }
@@ -279,6 +299,11 @@ def main():
                     stats[time_class]["draws"] += 1
                 else:
                     stats[time_class]["losses"] += 1
+                    if player_result == "abandoned":
+                        stats[time_class]["abandoned_total"] += 1
+                        is_w = (player_color == "white")
+                        if count_material_deficit(game.get("fen", ""), is_w):
+                            stats[time_class]["abandoned_deficit"] += 1
 
                 if player_acc is not None:
                     stats[time_class]["accuracy_sum"] += float(player_acc)
@@ -336,6 +361,9 @@ def main():
     for cat in TARGET_CATEGORIES:
         data = stats[cat]
         count = data["count"]
+        if count == 0:
+            continue
+
         w = data["wins"]
         d = data["draws"]
         l = data["losses"]
@@ -345,30 +373,24 @@ def main():
         acc_sum = data["accuracy_sum"]
         total_acc_count += acc_cnt
 
-        if count > 0 and rating is not None:
-            dt_str = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-            rating_str = str(rating)
-            wdl_str = f"{w}-{d}-{l}"
-            score_pct = ((w + 0.5 * d) / count) * 100.0
-            score_str = f"{score_pct:>5.1f}%"
+        dt_str = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ) if ts else "N/A"
+        rating_str = str(rating) if rating is not None else "N/A"
+        wdl_str = f"{w}-{d}-{l}"
+        score_pct = ((w + 0.5 * d) / count) * 100.0
+        score_str = f"{score_pct:>5.1f}%"
+        if rating is not None:
             active_categories[cat] = rating
 
-            if acc_cnt >= MIN_ANALYZED_THRESHOLD:
-                avg_acc = acc_sum / acc_cnt
-                acc_display = f"{avg_acc:>5.1f}% ({acc_cnt:>4}/{count:<5})"
-            elif acc_cnt > 0:
-                avg_acc = acc_sum / acc_cnt
-                acc_display = f"{avg_acc:>5.1f}%*({acc_cnt:>2}/{count:<5})"
-            else:
-                acc_display = f"  N/A  (   0/{count:<5})"
+        if acc_cnt >= MIN_ANALYZED_THRESHOLD:
+            avg_acc = acc_sum / acc_cnt
+            acc_display = f"{avg_acc:>5.1f}% ({acc_cnt:>4}/{count:<5})"
+        elif acc_cnt > 0:
+            avg_acc = acc_sum / acc_cnt
+            acc_display = f"{avg_acc:>5.1f}%*({acc_cnt:>2}/{count:<5})"
         else:
-            dt_str = "N/A"
-            rating_str = "N/A"
-            wdl_str = "N/A"
-            score_str = "N/A"
-            acc_display = "N/A"
+            acc_display = f"  N/A  (   0/{count:<5})"
 
         print(f"{cat.capitalize():<10} | {count:<8} | {wdl_str:<15} | {score_str:<9} | {acc_display:<22} | {rating_str:<8} | {dt_str:<20}", flush=True)
 
@@ -389,6 +411,16 @@ def main():
         print(f"Only one active rated category found: {cat.capitalize()} ({rating}). Spread not applicable.", flush=True)
     else:
         print("No rated games found in bullet, blitz, rapid, or daily categories.", flush=True)
+
+    # Abandoned Telemetry (Sparse: only categories with abandoned games)
+    has_abandoned = any(stats[cat]["abandoned_total"] > 0 for cat in TARGET_CATEGORIES)
+    if has_abandoned:
+        print("\n-- ABANDONED GAMES TELEMETRY " + "-" * (102 - len("-- ABANDONED GAMES TELEMETRY ")), flush=True)
+        for cat in TARGET_CATEGORIES:
+            ab_total = stats[cat]["abandoned_total"]
+            ab_def = stats[cat]["abandoned_deficit"]
+            if ab_total > 0:
+                print(f"{cat.capitalize():<6} Abandoned Losses : {ab_total} total | {ab_def} with Material Deficit (<= -3 pts)", flush=True)
 
     print("=" * 102, flush=True)
 
@@ -489,15 +521,14 @@ def main():
     print(" RATING TRAJECTORY, DORMANCY & SURGE ANALYSIS", flush=True)
     print("=" * 102, flush=True)
 
-    # 4A: Initial Account Onboarding
+    # 4A: Initial Account Onboarding (Sparse: only categories with games)
     print(f"\n-- INITIAL ACCOUNT ONBOARDING (First {ONBOARDING_GAMES} Games per Pool) " + "-" * max(0, (102 - len(f"-- INITIAL ACCOUNT ONBOARDING (First {ONBOARDING_GAMES} Games per Pool) "))), flush=True)
-    print(f"{'Category':<10} | {'Initial -> End':<19} | {'Delta':<8} | {'Win Rate':<9} | {'Max Streak':<11} | {'Avg Opponent':<12}", flush=True)
+    print(f"{'Category':<10} | {'Initial -> End':<19} | {'Delta':<8} | {'Win Rate':<9} | {'Max Win Streak':<15} | {'Avg Opponent':<12}", flush=True)
     print("-" * 102, flush=True)
 
     for cat in TARGET_CATEGORIES:
         games = category_games[cat]
         if not games:
-            print(f"{cat.capitalize():<10} | {'No games played':<19} | {'N/A':<8} | {'N/A':<9} | {'N/A':<11} | {'N/A':<12}", flush=True)
             continue
 
         sample = games[:ONBOARDING_GAMES]
@@ -523,7 +554,7 @@ def main():
         avg_opp = sum(g["opponent_rating"] for g in sample) / sample_count if sample_count > 0 else 0
 
         rating_range_str = f"{init_rating} -> {final_rating} (#{sample_count})"
-        print(f"{cat.capitalize():<10} | {rating_range_str:<19} | {delta_str:<8} | {win_rate:>5.1f}%   | {str(max_streak_len) + ' games':<11} | {round(avg_opp):<12}", flush=True)
+        print(f"{cat.capitalize():<10} | {rating_range_str:<19} | {delta_str:<8} | {win_rate:>5.1f}%   | {str(max_streak_len) + ' games':<15} | {round(avg_opp):<12}", flush=True)
 
     print("-" * 102, flush=True)
 
