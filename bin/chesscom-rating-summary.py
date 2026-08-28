@@ -24,13 +24,13 @@
 #   Reports game counts, W-D-L records, overall score percentage, average
 #   accuracy with analysis coverage counts, latest rating, last played date
 #   per category, and rating spread. Detects suspicious streaks of consecutive
-#   short-ply games (0 < ply <= 13) and consecutive high-accuracy games
-#   (accuracy >= 94.0%, ply >= 30, strictly consecutive in actual play).
-#   Evaluates rating trajectories, dormancy gaps, and high-velocity surges
-#   with density-gated accuracy corroboration. Concludes with a synthesized
-#   verdict (Human, Smoke, or Fire) evaluating fair-play risk.
+#   short-ply games (0 < ply <= 13) and consecutive high-accuracy winning streaks
+#   (accuracy >= 96.0%, ply >= 35, 100% wins, strictly consecutive and time-bounded
+#   within <= 48h, live categories only). Evaluates rating trajectories, dormancy
+#   gaps, and high-velocity surges with density-gated accuracy corroboration.
+#   Concludes with a synthesized verdict (Human, Smoke, or Fire) evaluating fair-play risk.
 #
-# Version: v0.1.2
+# Version: v0.1.3
 
 import argparse
 import datetime
@@ -41,10 +41,11 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.1.2 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.1.3 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid", "daily")
+LIVE_CATEGORIES = ("bullet", "blitz", "rapid")
 DEFAULT_MAX_PLY = 13
 DEFAULT_MIN_STREAK = 3
 DEFAULT_ONBOARDING_GAMES = 50
@@ -64,8 +65,9 @@ DEFAULT_SURGE_MIN_WIN_RATE = 75.0
 
 # Accuracy defaults
 DEFAULT_MIN_ACC_STREAK = 3
-DEFAULT_MIN_ACC_PLY = 30
-DEFAULT_ACC_STREAK_THRESHOLD = 94.0
+DEFAULT_MIN_ACC_PLY = 35
+DEFAULT_ACC_STREAK_THRESHOLD = 96.0
+DEFAULT_ACC_STREAK_MAX_HOURS = 48.0
 MIN_ANALYZED_THRESHOLD = 10
 
 
@@ -125,7 +127,7 @@ def extract_event_type(pgn_str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scan Chess.com archives for rated games, summaries, short-ply streaks, accuracy streaks, dormancy gaps, and surges."
+        description="Scan Chess.com archives for rated games, summaries, short-ply streaks, accuracy winning streaks, dormancy gaps, and surges."
     )
     parser.add_argument("username", help="Chess.com target username")
     parser.add_argument(
@@ -204,19 +206,25 @@ def main():
         "--acc-min-streak",
         type=int,
         default=DEFAULT_MIN_ACC_STREAK,
-        help=f"Minimum consecutive high-accuracy games to flag as a streak (default: {DEFAULT_MIN_ACC_STREAK})",
+        help=f"Minimum consecutive high-accuracy wins to flag as a streak (default: {DEFAULT_MIN_ACC_STREAK})",
     )
     parser.add_argument(
         "--acc-min-ply",
         type=int,
         default=DEFAULT_MIN_ACC_PLY,
-        help=f"Minimum ply required to count an accuracy score toward a streak (default: {DEFAULT_MIN_ACC_PLY})",
+        help=f"Minimum ply required for an accuracy score to count toward a streak (default: {DEFAULT_MIN_ACC_PLY})",
     )
     parser.add_argument(
         "--acc-threshold",
         type=float,
         default=DEFAULT_ACC_STREAK_THRESHOLD,
         help=f"Minimum accuracy percentage required for streak games (default: {DEFAULT_ACC_STREAK_THRESHOLD}%%)",
+    )
+    parser.add_argument(
+        "--acc-max-hours",
+        type=float,
+        default=DEFAULT_ACC_STREAK_MAX_HOURS,
+        help=f"Maximum total elapsed hours for an accuracy streak to count as a session (default: {DEFAULT_ACC_STREAK_MAX_HOURS}h)",
     )
     args = parser.parse_args()
 
@@ -486,27 +494,47 @@ def main():
                 matchup_info = f"vs {g['opponent']} ({g['player_rating']}/{g['opponent_rating']})"
                 print(f"  [{g['outcome']:<4}] {g['time_class'].capitalize():<6} | {g['ply']:>2} ply | {g['event_type']:<7} | {matchup_info:<30} | {dt_str} UTC | {g['url']}", flush=True)
 
-    # Section 3: High-Accuracy Streak Detection
+    # Section 3: High-Accuracy Winning Streak Detection (Live Pools Only, 100% Wins, Time-Bounded)
     print(f"\n" + "=" * 102, flush=True)
-    print(f" HIGH-ACCURACY STREAKS (>= {args.acc_threshold:.1f}% Acc, >= {args.acc_min_ply} Ply, >= {args.acc_min_streak} Strictly Consecutive Games)", flush=True)
+    print(f" HIGH-ACCURACY WINNING STREAKS (>= {args.acc_threshold:.1f}% Acc, >= {args.acc_min_ply} Ply, 100% Wins, <= {args.acc_max_hours:.0f}h, >= {args.acc_min_streak} Games)", flush=True)
     print("=" * 102, flush=True)
 
+    max_gap_seconds = args.acc_max_hours * 3600.0
     acc_streaks = []
-    for cat in TARGET_CATEGORIES:
+
+    for cat in LIVE_CATEGORIES:
         games = category_games[cat]
         current_acc_streak = []
         for g in games:
-            if g["accuracy"] is not None and g["accuracy"] >= args.acc_threshold and g["ply"] >= args.acc_min_ply:
-                current_acc_streak.append(g)
+            # Must be a WIN, meeting accuracy and ply floors
+            is_candidate = (
+                g["outcome"] == "WIN"
+                and g["accuracy"] is not None
+                and g["accuracy"] >= args.acc_threshold
+                and g["ply"] >= args.acc_min_ply
+            )
+
+            if is_candidate:
+                if current_acc_streak:
+                    elapsed = g["end_time"] - current_acc_streak[0]["end_time"]
+                    if elapsed <= max_gap_seconds:
+                        current_acc_streak.append(g)
+                    else:
+                        if len(current_acc_streak) >= args.acc_min_streak:
+                            acc_streaks.append(list(current_acc_streak))
+                        current_acc_streak = [g]
+                else:
+                    current_acc_streak.append(g)
             else:
                 if len(current_acc_streak) >= args.acc_min_streak:
                     acc_streaks.append(list(current_acc_streak))
                 current_acc_streak = []
+
         if len(current_acc_streak) >= args.acc_min_streak:
             acc_streaks.append(list(current_acc_streak))
 
     if not acc_streaks:
-        print(f"No strictly consecutive streaks of >= {args.acc_min_streak} high-accuracy games detected.", flush=True)
+        print(f"No consecutive winning streaks of >= {args.acc_min_streak} high-accuracy live games detected.", flush=True)
     else:
         for idx, streak in enumerate(acc_streaks, start=1):
             avg_acc = sum(g["accuracy"] for g in streak) / len(streak)
@@ -514,8 +542,9 @@ def main():
             cat_name = streak[0]["time_class"].capitalize()
             start_dt = datetime.datetime.fromtimestamp(streak[0]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             end_dt = datetime.datetime.fromtimestamp(streak[-1]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            duration_hrs = (streak[-1]["end_time"] - streak[0]["end_time"]) / 3600.0
 
-            print(f"\n[Acc Streak #{idx}] {cat_name} | {len(streak)} games (Avg Acc: {avg_acc:.1f}%, Peak: {peak_acc:.1f}%) | {start_dt} to {end_dt} UTC", flush=True)
+            print(f"\n[Acc Streak #{idx}] {cat_name} | {len(streak)} Wins (Avg Acc: {avg_acc:.1f}%, Peak: {peak_acc:.1f}%) | {duration_hrs:.1f} hours | {start_dt} to {end_dt} UTC", flush=True)
             print("-" * 102, flush=True)
             for g in streak:
                 dt_str = datetime.datetime.fromtimestamp(g["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -763,7 +792,7 @@ def main():
     for a_streak in acc_streaks:
         if len(a_streak) >= 4:
             avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
-            signals_fire.append(f"Extensive high-accuracy streak ({len(a_streak)} consecutive games, avg {avg_a:.1f}% acc)")
+            signals_fire.append(f"Extensive high-accuracy winning streak ({len(a_streak)} consecutive wins, avg {avg_a:.1f}% acc)")
 
     total_short_games = sum(len(st) for st in streaks)
     max_streak_len = max([len(st) for st in streaks]) if streaks else 0
@@ -777,9 +806,9 @@ def main():
                 signals_smoke.append(f"Elevated surge session (+{s['gain']} pts over {s['game_count']} games, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day)")
 
     for a_streak in acc_streaks:
-        if len(a_streak) == 3 and not any("high-accuracy streak" in f for f in signals_fire):
+        if len(a_streak) == 3 and not any("high-accuracy winning streak" in f for f in signals_fire):
             avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
-            signals_smoke.append(f"High-accuracy streak ({len(a_streak)} consecutive games >= {args.acc_threshold:.1f}% acc, avg {avg_a:.1f}%)")
+            signals_smoke.append(f"High-accuracy winning streak ({len(a_streak)} consecutive wins >= {args.acc_threshold:.1f}% acc, avg {avg_a:.1f}%)")
 
     if len(streaks) >= 2 and not signals_fire:
         signals_smoke.append(f"Multiple short-ply streaks detected ({len(streaks)} streaks)")
@@ -805,7 +834,7 @@ def main():
     if acc_streaks:
         max_acc_len = max(len(st) for st in acc_streaks)
         peak_acc_all = max(max(g["accuracy"] for g in st) for st in acc_streaks)
-        acc_signal_str = f"{len(acc_streaks)} streaks found (Max: {max_acc_len} games, Peak Acc: {peak_acc_all:.1f}%)"
+        acc_signal_str = f"{len(acc_streaks)} winning streaks found (Max: {max_acc_len} games, Peak Acc: {peak_acc_all:.1f}%)"
     else:
         overall_acc_coverage = (total_acc_count / total_games_all) * 100.0 if total_games_all > 0 else 0.0
         if total_acc_count < MIN_ANALYZED_THRESHOLD:
