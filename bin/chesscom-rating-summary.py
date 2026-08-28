@@ -29,24 +29,23 @@
 #   (accuracy >= 96.0%, ply >= 45, 100% wins, strictly consecutive and time-bounded
 #   within <= 48h, live categories only). Evaluates rating trajectories, dormancy
 #   gaps, and high-velocity surges with density-gated accuracy corroboration.
-#   Synthesizes verdicts (Human, Smoke, or Fire) with explicit category names,
-#   dates in evaluation details, clear trigger attribution, and pool breakdowns.
+#   Synthesizes graduated verdicts (Human, Smoke, or Fire) with explicit category
+#   names, dates in evaluation details, clear trigger attribution, and pool breakdowns.
+#   Includes robust HTTP 429/transient retry backoff and customizable User-Agent contact.
 #
-# Version: v0.1.6
+# Version: v1.0.0
 
 import argparse
 import datetime
 import json
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 
-VERSION = "v0.1.6"
-
-HEADERS = {
-    "User-Agent": f"chesscom-rating-summary/{VERSION.lstrip('v')} (Contact: GitHub/Mouselip)"
-}
+VERSION = "v1.0.0"
+REPO_URL = "https://github.com/Mouselip/chess-tools"
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid", "daily")
 LIVE_CATEGORIES = ("bullet", "blitz", "rapid")
@@ -75,24 +74,39 @@ DEFAULT_ACC_STREAK_MAX_HOURS = 48.0
 MIN_ANALYZED_THRESHOLD = 10
 
 
-def fetch_json(url):
-    req = urllib.request.Request(url, headers=HEADERS)
-    try:
-        with urllib.request.urlopen(req) as resp:
-            if resp.status == 200:
-                return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            sys.stderr.write(f"\n[-] Error: Resource not found at {url}\n")
-        else:
-            sys.stderr.write(f"\n[-] HTTP Error {e.code}: {e.reason}\n")
-        sys.stderr.flush()
-    except urllib.error.URLError as e:
-        sys.stderr.write(f"\n[-] URL Error: {e.reason}\n")
-        sys.stderr.flush()
-    except Exception as e:
-        sys.stderr.write(f"\n[-] Unexpected error: {e}\n")
-        sys.stderr.flush()
+def fetch_json(url, user_agent, max_retries=3):
+    headers = {"User-Agent": user_agent}
+    req = urllib.request.Request(url, headers=headers)
+    for attempt in range(1, max_retries + 1):
+        try:
+            with urllib.request.urlopen(req) as resp:
+                if resp.status == 200:
+                    return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                sys.stderr.write(f"\n[-] Error: Resource not found at {url}\n")
+                sys.stderr.flush()
+                return None
+            elif e.code in (429, 500, 502, 503, 504):
+                sleep_seconds = attempt * 2
+                sys.stderr.write(f"\n[!] HTTP {e.code} ({e.reason}) at {url}. Backing off {sleep_seconds}s (retry {attempt}/{max_retries})...\n")
+                sys.stderr.flush()
+                time.sleep(sleep_seconds)
+            else:
+                sys.stderr.write(f"\n[-] HTTP Error {e.code}: {e.reason}\n")
+                sys.stderr.flush()
+                return None
+        except urllib.error.URLError as e:
+            sleep_seconds = attempt * 2
+            sys.stderr.write(f"\n[!] Network error: {e.reason}. Retrying in {sleep_seconds}s ({attempt}/{max_retries})...\n")
+            sys.stderr.flush()
+            time.sleep(sleep_seconds)
+        except Exception as e:
+            sys.stderr.write(f"\n[-] Unexpected error: {e}\n")
+            sys.stderr.flush()
+            return None
+    sys.stderr.write(f"[-] Max retries exceeded for {url}\n")
+    sys.stderr.flush()
     return None
 
 
@@ -134,6 +148,12 @@ def main():
         description="Scan Chess.com archives for rated games, summaries, short-ply streaks, accuracy winning streaks, dormancy gaps, and surges."
     )
     parser.add_argument("username", help="Chess.com target username")
+    parser.add_argument(
+        "--contact",
+        type=str,
+        default="",
+        help="Optional contact info (email/handle) to include in the API User-Agent header",
+    )
     parser.add_argument(
         "--max-ply",
         type=int,
@@ -241,9 +261,13 @@ def main():
     dormancy_sec = args.dormancy_days * 86400
     ext_dormancy_sec = args.extended_dormancy_days * 86400
 
+    # Build compliant User-Agent
+    contact_str = f"Contact: {args.contact}" if args.contact else f"{REPO_URL}"
+    user_agent = f"chesscom-rating-summary/{VERSION.lstrip('v')} ({contact_str})"
+
     # Fetch user profile metadata for account status
     profile_url = f"https://api.chess.com/pub/player/{username_lower}"
-    profile_data = fetch_json(profile_url)
+    profile_data = fetch_json(profile_url, user_agent=user_agent)
     if profile_data:
         account_status = profile_data.get("status", "unknown")
         player_title = profile_data.get("title", "")
@@ -252,7 +276,7 @@ def main():
         player_title = ""
 
     archives_url = f"https://api.chess.com/pub/player/{username_lower}/games/archives"
-    archives_data = fetch_json(archives_url)
+    archives_data = fetch_json(archives_url, user_agent=user_agent)
 
     if not archives_data or "archives" not in archives_data:
         sys.stderr.write(f"\n[-] Failed to retrieve archives for player: {username}\n")
@@ -292,7 +316,7 @@ def main():
         sys.stderr.write(f"\r[*] Fetching archive [{idx}/{total_months}]: {year_month}...")
         sys.stderr.flush()
 
-        month_data = fetch_json(month_url)
+        month_data = fetch_json(month_url, user_agent=user_agent)
         if not month_data:
             continue
 
