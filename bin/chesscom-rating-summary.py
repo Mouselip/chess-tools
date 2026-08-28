@@ -21,11 +21,11 @@
 #   for rated games in bullet, blitz, and rapid categories. Reports
 #   game counts, latest rating, last played date per category, and the
 #   rating spread between highest and lowest categories. Additionally
-#   detects suspicious streaks of consecutive short-ply games (<= 3 ply)
+#   detects suspicious streaks of consecutive short-ply games (<= 13 ply)
 #   regardless of opponent to identify rating farming, sandbagging, or
 #   rapid rating dumping.
 #
-# Version: v0.0.4
+# Version: v0.0.5
 
 import argparse
 import datetime
@@ -36,11 +36,11 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.0.4 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.0.5 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid")
-DEFAULT_MAX_PLY = 3
+DEFAULT_MAX_PLY = 13
 DEFAULT_MIN_STREAK = 3
 
 
