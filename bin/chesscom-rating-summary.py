@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 #
 # Copyright (c) 2026 Tyrin R. Price
+# chesscom-rating-summary.py
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,12 +25,12 @@
 #   suspicious streaks of consecutive short-ply games (0 < ply <= 13)
 #   regardless of opponent to identify rating farming, sandbagging, or
 #   rapid rating dumping with event categorization and dual player/opponent
-#   ratings. Additionally provides comprehensive rating trajectory analysis
-#   including initial account onboarding profiles, long periods of dormancy/
-#   inactivity, high-velocity rating surges, and post-dormancy reactivation
-#   surge alerts.
+#   ratings. Evaluates rating trajectories by categorizing dormancy gaps
+#   into standard (>= 30 days) and extended (>= 90 days) tiers, and flags
+#   high-density, rapid rating surges bounded strictly by calendar time,
+#   minimum game volume, and daily velocity.
 #
-# Version: v0.0.9
+# Version: v0.0.10
 
 import argparse
 import datetime
@@ -40,16 +41,23 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.0.9 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.0.10 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid")
 DEFAULT_MAX_PLY = 13
 DEFAULT_MIN_STREAK = 3
 DEFAULT_ONBOARDING_GAMES = 30
-DEFAULT_MIN_GAP_DAYS = 30
-DEFAULT_SURGE_PTS = 200
-DEFAULT_SURGE_GAMES = 20
+
+# Inactivity defaults
+DEFAULT_STANDARD_DORMANCY_DAYS = 30
+DEFAULT_EXTENDED_DORMANCY_DAYS = 90
+
+# Surge defaults
+DEFAULT_SURGE_MIN_PTS = 150
+DEFAULT_SURGE_MAX_DAYS = 7
+DEFAULT_SURGE_MIN_GAMES = 15
+DEFAULT_SURGE_MIN_VELOCITY = 20.0
 
 
 def fetch_json(url):
@@ -105,7 +113,7 @@ def extract_event_type(pgn_str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scan Chess.com archives for rated games, summaries, short-ply streaks, dormancy, and surges."
+        description="Scan Chess.com archives for rated games, summaries, short-ply streaks, dormancy gaps, and surges."
     )
     parser.add_argument("username", help="Chess.com target username")
     parser.add_argument(
@@ -127,22 +135,40 @@ def main():
         help=f"Number of initial games per category for onboarding profile (default: {DEFAULT_ONBOARDING_GAMES})",
     )
     parser.add_argument(
-        "--min-gap-days",
+        "--dormancy-days",
         type=int,
-        default=DEFAULT_MIN_GAP_DAYS,
-        help=f"Minimum days of inactivity between games to flag dormancy (default: {DEFAULT_MIN_GAP_DAYS})",
+        default=DEFAULT_STANDARD_DORMANCY_DAYS,
+        help=f"Minimum days of inactivity for standard dormancy (default: {DEFAULT_STANDARD_DORMANCY_DAYS})",
     )
     parser.add_argument(
-        "--surge-pts",
+        "--extended-dormancy-days",
         type=int,
-        default=DEFAULT_SURGE_PTS,
-        help=f"Minimum rating gain to flag as a surge (default: {DEFAULT_SURGE_PTS})",
+        default=DEFAULT_EXTENDED_DORMANCY_DAYS,
+        help=f"Minimum days of inactivity for extended dormancy (default: {DEFAULT_EXTENDED_DORMANCY_DAYS})",
     )
     parser.add_argument(
-        "--surge-games",
+        "--surge-min-pts",
         type=int,
-        default=DEFAULT_SURGE_GAMES,
-        help=f"Maximum game window for a surge to occur (default: {DEFAULT_SURGE_GAMES})",
+        default=DEFAULT_SURGE_MIN_PTS,
+        help=f"Minimum rating gain for surge detection (default: {DEFAULT_SURGE_MIN_PTS})",
+    )
+    parser.add_argument(
+        "--surge-max-days",
+        type=float,
+        default=DEFAULT_SURGE_MAX_DAYS,
+        help=f"Maximum calendar days span for a surge window (default: {DEFAULT_SURGE_MAX_DAYS})",
+    )
+    parser.add_argument(
+        "--surge-min-games",
+        type=int,
+        default=DEFAULT_SURGE_MIN_GAMES,
+        help=f"Minimum game volume required within surge window (default: {DEFAULT_SURGE_MIN_GAMES})",
+    )
+    parser.add_argument(
+        "--surge-min-velocity",
+        type=float,
+        default=DEFAULT_SURGE_MIN_VELOCITY,
+        help=f"Minimum rating points gained per day (default: {DEFAULT_SURGE_MIN_VELOCITY})",
     )
     args = parser.parse_args()
 
@@ -151,9 +177,8 @@ def main():
     max_ply = args.max_ply
     min_streak = args.min_streak
     onboarding_limit = args.onboarding_games
-    min_gap_seconds = args.min_gap_days * 86400
-    surge_pts = args.surge_pts
-    surge_games = args.surge_games
+    dormancy_sec = args.dormancy_days * 86400
+    ext_dormancy_sec = args.extended_dormancy_days * 86400
 
     archives_url = f"https://api.chess.com/pub/player/{username_lower}/games/archives"
     archives_data = fetch_json(archives_url)
@@ -225,7 +250,7 @@ def main():
                     stats[time_class]["last_played_ts"] = end_time
                     stats[time_class]["latest_rating"] = player_rating
 
-            # Collect game metadata for sequential streak and trajectory analysis
+            # Collect game metadata for analysis
             pgn = game.get("pgn", "")
             ply_count = count_ply_from_pgn(pgn)
             event_type = extract_event_type(pgn)
@@ -385,9 +410,9 @@ def main():
 
     print("-" * 78)
 
-    # 3B: Periods of Inactivity / Dormancy
-    print(f"\n-- MAJOR DORMANCY PERIODS (Gaps >= {args.min_gap_days} Days) " + "-" * (78 - len(f"-- MAJOR DORMANCY PERIODS (Gaps >= {args.min_gap_days} Days) ")))
-    print(f"{'Category':<10} | {'Inactive Period (UTC)':<31} | {'Gap Duration':<13} | {'Pre -> Post Rating':<18}")
+    # 3B: Inactivity & Dormancy Gaps
+    print(f"\n-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) " + "-" * (78 - len(f"-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) ")))
+    print(f"{'Category':<10} | {'Inactive Period (UTC)':<25} | {'Duration':<11} | {'Tier':<10} | {'Pre -> Post':<13}")
     print("-" * 78)
 
     dormancy_events = []
@@ -401,82 +426,89 @@ def main():
             g_next = games[i + 1]
             gap_seconds = g_next["end_time"] - g_prev["end_time"]
 
-            if gap_seconds >= min_gap_seconds:
+            if gap_seconds >= dormancy_sec:
                 gap_days = gap_seconds // 86400
+                tier = "Extended" if gap_seconds >= ext_dormancy_sec else "Standard"
                 d_start = datetime.datetime.fromtimestamp(g_prev["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
                 d_end = datetime.datetime.fromtimestamp(g_next["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
                 period_str = f"{d_start} -> {d_end}"
                 rating_str = f"{g_prev['player_rating']} -> {g_next['player_rating']}"
-                
+
                 dormancy_events.append({
                     "category": cat,
                     "gap_days": gap_days,
                     "gap_seconds": gap_seconds,
+                    "tier": tier,
                     "pre_time": g_prev["end_time"],
                     "post_time": g_next["end_time"],
                     "post_game_index": i + 1,
                     "pre_rating": g_prev["player_rating"],
                     "post_rating": g_next["player_rating"],
                 })
-                print(f"{cat.capitalize():<10} | {period_str:<31} | {str(gap_days) + ' days':<13} | {rating_str:<18}")
+                print(f"{cat.capitalize():<10} | {period_str:<25} | {str(gap_days) + ' days':<11} | {tier:<10} | {rating_str:<13}")
 
     if not dormancy_events:
-        print(f"No dormancy gaps >= {args.min_gap_days} days detected.")
+        print(f"No inactivity gaps >= {args.dormancy_days} days detected.")
     print("-" * 78)
 
     # 3C: High-Velocity Surge Windows
-    print(f"\n-- HIGH-VELOCITY SURGE WINDOWS (Gain >= +{surge_pts} pts in <= {surge_games} games) " + "-" * (78 - len(f"-- HIGH-VELOCITY SURGE WINDOWS (Gain >= +{surge_pts} pts in <= {surge_games} games) ")))
+    surge_criteria_str = f"-- HIGH-VELOCITY SURGES (Gain >= +{args.surge_min_pts} pts, >= {args.surge_min_games} games, <= {args.surge_max_days}d, >= {args.surge_min_velocity} pts/d) "
+    print(f"\n{surge_criteria_str}" + "-" * max(0, 78 - len(surge_criteria_str)))
 
     surges = []
     for cat in TARGET_CATEGORIES:
         games = category_games[cat]
         n_games = len(games)
-        if n_games < 2:
+        if n_games < args.surge_min_games:
             continue
 
         for i in range(n_games):
             start_g = games[i]
-            max_j = min(i + surge_games, n_games)
-            for j in range(i + 1, max_j):
+            for j in range(i + args.surge_min_games - 1, n_games):
                 end_g = games[j]
+                time_diff = end_g["end_time"] - start_g["end_time"]
+                days_diff = max(time_diff / 86400.0, 0.01)
+
+                if days_diff > args.surge_max_days:
+                    break
+
                 gain = end_g["player_rating"] - start_g["player_rating"]
-                if gain >= surge_pts:
-                    window_games = games[i:j + 1]
-                    wins = sum(1 for g in window_games if g["outcome"] == "WIN")
-                    losses = sum(1 for g in window_games if g["outcome"] == "LOSS")
-                    draws = sum(1 for g in window_games if g["outcome"] == "DRAW")
-                    time_diff = end_g["end_time"] - start_g["end_time"]
-                    days_diff = max(time_diff / 86400.0, 0.01)
-                    pace_game = gain / (len(window_games) - 1)
-                    pace_day = gain / days_diff
+                if gain >= args.surge_min_pts:
+                    velocity = gain / days_diff
+                    if velocity >= args.surge_min_velocity:
+                        window_games = games[i:j + 1]
+                        wins = sum(1 for g in window_games if g["outcome"] == "WIN")
+                        losses = sum(1 for g in window_games if g["outcome"] == "LOSS")
+                        draws = sum(1 for g in window_games if g["outcome"] == "DRAW")
+                        pace_game = gain / (len(window_games) - 1)
 
-                    # Check for reactivation alert (surge starts within 3 games after a dormancy gap)
-                    reactivation_info = None
-                    for d in dormancy_events:
-                        if d["category"] == cat:
-                            if 0 <= (i - d["post_game_index"]) <= 2:
-                                reactivation_info = d
-                                break
+                        # Check if surge began immediately post-dormancy
+                        reactivation_info = None
+                        for d in dormancy_events:
+                            if d["category"] == cat:
+                                if 0 <= (i - d["post_game_index"]) <= 2:
+                                    reactivation_info = d
+                                    break
 
-                    surges.append({
-                        "category": cat,
-                        "gain": gain,
-                        "start_rating": start_g["player_rating"],
-                        "end_rating": end_g["player_rating"],
-                        "game_count": len(window_games),
-                        "start_time": start_g["end_time"],
-                        "end_time": end_g["end_time"],
-                        "days": days_diff,
-                        "wins": wins,
-                        "losses": losses,
-                        "draws": draws,
-                        "pace_game": pace_game,
-                        "pace_day": pace_day,
-                        "start_game": start_g,
-                        "end_game": end_g,
-                        "window_games": window_games,
-                        "reactivation": reactivation_info,
-                    })
+                        surges.append({
+                            "category": cat,
+                            "gain": gain,
+                            "start_rating": start_g["player_rating"],
+                            "end_rating": end_g["player_rating"],
+                            "game_count": len(window_games),
+                            "start_time": start_g["end_time"],
+                            "end_time": end_g["end_time"],
+                            "days": days_diff,
+                            "wins": wins,
+                            "losses": losses,
+                            "draws": draws,
+                            "pace_game": pace_game,
+                            "pace_day": velocity,
+                            "start_game": start_g,
+                            "end_game": end_g,
+                            "window_games": window_games,
+                            "reactivation": reactivation_info,
+                        })
 
     # Deduplicate overlapping surge windows to keep the most significant
     surges.sort(key=lambda s: s["start_time"])
@@ -486,7 +518,6 @@ def main():
             filtered_surges.append(s)
             continue
         prev = filtered_surges[-1]
-        # Overlapping surge in same category
         if s["category"] == prev["category"] and s["start_time"] <= prev["end_time"]:
             if s["gain"] > prev["gain"]:
                 filtered_surges[-1] = s
@@ -494,7 +525,7 @@ def main():
             filtered_surges.append(s)
 
     if not filtered_surges:
-        print(f"No surge windows detected matching criteria (+{surge_pts} pts in <= {surge_games} games).")
+        print(f"No high-velocity surge windows detected.")
     else:
         for idx, s in enumerate(filtered_surges, start=1):
             start_dt = datetime.datetime.fromtimestamp(s["start_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -511,7 +542,8 @@ def main():
 
             if s["reactivation"]:
                 gap_d = s["reactivation"]["gap_days"]
-                print(f"Alert : REACTIVATION SURGE -> Immediate surge began right after {gap_d} days of dormancy!")
+                tier_str = s["reactivation"]["tier"]
+                print(f"Alert : REACTIVATION SURGE -> Surge began immediately after {gap_d} days of {tier_str.lower()} dormancy!")
 
             print("-" * 78)
             print(f"  Start Match : {s['start_rating']} vs {s['start_game']['opponent']} ({s['start_game']['opponent_rating']}) | {start_dt} UTC")
