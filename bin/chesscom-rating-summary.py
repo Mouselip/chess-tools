@@ -23,9 +23,9 @@
 #   rating spread between highest and lowest categories. Additionally
 #   detects suspicious streaks of consecutive short-ply games (<= 13 ply)
 #   regardless of opponent to identify rating farming, sandbagging, or
-#   rapid rating dumping.
+#   rapid rating dumping, including win/loss breakdown on the streak header.
 #
-# Version: v0.0.5
+# Version: v0.0.6
 
 import argparse
 import datetime
@@ -36,7 +36,7 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.0.5 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.0.6 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid")
@@ -276,13 +276,12 @@ def main():
             start_dt = datetime.datetime.fromtimestamp(streak[0]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             end_dt = datetime.datetime.fromtimestamp(streak[-1]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-            print(f"\n[Streak #{idx}] Length: {len(streak)} games | {start_dt} to {end_dt} UTC")
-            print(f"Breakdown: {wins} Wins, {losses} Losses, {draws} Draws")
+            print(f"\n[Streak #{idx}] Length: {len(streak)} games (+{wins} -{losses} ={draws}) | {start_dt} to {end_dt} UTC")
             print("-" * 62)
             for g in streak:
                 dt_str = datetime.datetime.fromtimestamp(g["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 opp_info = f"{g['opponent']} ({g['opponent_rating']})"
-                print(f"  [{g['outcome']:<4}] {g['time_class'].capitalize():<6} | {g['ply']} ply | vs {opp_info:<22} | {dt_str} UTC | {g['url']}")
+                print(f"  [{g['outcome']:<4}] {g['time_class'].capitalize():<6} | {g['ply']:>2} ply | vs {opp_info:<22} | {dt_str} UTC | {g['url']}")
 
     print("\n" + "=" * 62 + "\n")
 
