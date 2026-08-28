@@ -23,9 +23,11 @@
 #   rating spread between highest and lowest categories. Additionally
 #   detects suspicious streaks of consecutive short-ply games (0 < ply <= 13)
 #   regardless of opponent to identify rating farming, sandbagging, or
-#   rapid rating dumping, including win/loss breakdown on the streak header.
+#   rapid rating dumping. Categorizes game events as Arena, Tourney, or
+#   Pool, displays combined player/opponent rating matchups, and includes
+#   win/loss breakdowns on streak headers.
 #
-# Version: v0.0.7
+# Version: v0.0.8
 
 import argparse
 import datetime
@@ -36,7 +38,7 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.0.7 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.0.8 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid")
@@ -79,6 +81,20 @@ def count_ply_from_pgn(pgn_str):
         if token:
             moves.append(token)
     return len(moves)
+
+
+def extract_event_type(pgn_str):
+    if not pgn_str:
+        return "Pool"
+    match = re.search(r'\[Event\s+"([^"]+)"\]', pgn_str)
+    if not match:
+        return "Pool"
+    event_str = match.group(1).lower()
+    if "arena" in event_str:
+        return "Arena"
+    elif "tournament" in event_str or "tourney" in event_str or "swiss" in event_str:
+        return "Tourney"
+    return "Pool"
 
 
 def main():
@@ -177,6 +193,7 @@ def main():
             # Collect game metadata for sequential streak analysis
             pgn = game.get("pgn", "")
             ply_count = count_ply_from_pgn(pgn)
+            event_type = extract_event_type(pgn)
             game_url = game.get("url", "")
 
             if player_result == "win":
@@ -192,9 +209,10 @@ def main():
                 "ply": ply_count,
                 "outcome": outcome,
                 "color": player_color,
+                "event_type": event_type,
                 "opponent": opponent_name,
                 "opponent_rating": opponent_rating,
-                "rating": player_rating,
+                "player_rating": player_rating,
                 "url": game_url,
             })
 
@@ -277,11 +295,11 @@ def main():
             end_dt = datetime.datetime.fromtimestamp(streak[-1]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
             print(f"\n[Streak #{idx}] Length: {len(streak)} games (+{wins} -{losses} ={draws}) | {start_dt} to {end_dt} UTC")
-            print("-" * 62)
+            print("-" * 78)
             for g in streak:
                 dt_str = datetime.datetime.fromtimestamp(g["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                opp_info = f"{g['opponent']} ({g['opponent_rating']})"
-                print(f"  [{g['outcome']:<4}] {g['time_class'].capitalize():<6} | {g['ply']:>2} ply | vs {opp_info:<22} | {dt_str} UTC | {g['url']}")
+                matchup_info = f"vs {g['opponent']} ({g['player_rating']}/{g['opponent_rating']})"
+                print(f"  [{g['outcome']:<4}] {g['time_class'].capitalize():<6} | {g['ply']:>2} ply | {g['event_type']:<7} | {matchup_info:<30} | {dt_str} UTC | {g['url']}")
 
     print("\n" + "=" * 62 + "\n")
 
