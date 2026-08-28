@@ -20,7 +20,8 @@
 # Description:
 #   Scans the Chess.com public archives for a target player, filtering
 #   for rated games across bullet, blitz, rapid, and daily categories.
-#   Retrieves player profile metadata to report account status and title.
+#   Retrieves player profile metadata to report account status, title,
+#   and script version at the top of the report.
 #   Reports game counts, W-D-L records, overall score percentage, average
 #   accuracy with analysis coverage counts, latest rating, last played date
 #   per category, and rating spread. Detects suspicious streaks of consecutive
@@ -28,11 +29,10 @@
 #   (accuracy >= 96.0%, ply >= 45, 100% wins, strictly consecutive and time-bounded
 #   within <= 48h, live categories only). Evaluates rating trajectories, dormancy
 #   gaps, and high-velocity surges with density-gated accuracy corroboration.
-#   Synthesizes verdicts (Human, Smoke, or Fire) with explicit forensic trigger
-#   attribution and context categorization (e.g., Rating Volatility / Recovery,
-#   Engine Assistance, Short-Ply Dumping).
+#   Synthesizes verdicts (Human, Smoke, or Fire) with explicit category names,
+#   dates in evaluation details, clear trigger attribution, and pool breakdowns.
 #
-# Version: v0.1.5
+# Version: v0.1.6
 
 import argparse
 import datetime
@@ -42,8 +42,10 @@ import sys
 import urllib.error
 import urllib.request
 
+VERSION = "v0.1.6"
+
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.1.5 (Contact: GitHub/Mouselip)"
+    "User-Agent": f"chesscom-rating-summary/{VERSION.lstrip('v')} (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid", "daily")
@@ -253,7 +255,7 @@ def main():
     archives_data = fetch_json(archives_url)
 
     if not archives_data or "archives" not in archives_data:
-        sys.stderr.write(f"[-] Failed to retrieve archives for player: {username}\n")
+        sys.stderr.write(f"\n[-] Failed to retrieve archives for player: {username}\n")
         sys.stderr.flush()
         sys.exit(1)
 
@@ -392,7 +394,10 @@ def main():
     # Section 1: Rating Summary Output
     print("=" * 102, flush=True)
     title_str = f" [{player_title}]" if player_title else ""
-    print(f" RATED RATING SUMMARY: {username}{title_str} | Status: {account_status}", flush=True)
+    header_left = f" RATED RATING SUMMARY: {username}{title_str} | Status: {account_status}"
+    header_right = f"{VERSION} "
+    header_spaces = max(1, 102 - len(header_left) - len(header_right))
+    print(f"{header_left}{' ' * header_spaces}{header_right}", flush=True)
     print("=" * 102, flush=True)
     print(f"{'Category':<10} | {'Games':<8} | {'W-D-L':<15} | {'Score %':<9} | {'Avg Acc (Analyzed)':<22} | {'Rating':<8} | {'Last Played (UTC)':<20}", flush=True)
     print("-" * 102, flush=True)
@@ -752,6 +757,7 @@ def main():
         print("No high-velocity surge windows detected.", flush=True)
     else:
         for idx, s in enumerate(filtered_surges, start=1):
+            s["surge_index"] = idx
             start_dt = datetime.datetime.fromtimestamp(s["start_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             end_dt = datetime.datetime.fromtimestamp(s["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             days_str = f"{s['days']:.1f} days" if s['days'] >= 1.0 else f"{round(s['days'] * 24, 1)} hours"
@@ -784,29 +790,40 @@ def main():
 
     # Check for Fire-level conditions
     for s in filtered_surges:
+        s_cat = s["category"].capitalize()
+        s_idx = s.get("surge_index", "?")
+        s_start_d = datetime.datetime.fromtimestamp(s["start_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+        s_end_d = datetime.datetime.fromtimestamp(s["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+        date_span_str = f"{s_start_d}" if s_start_d == s_end_d else f"{s_start_d} -> {s_end_d}"
+
         # Surge with high accuracy corroboration
         if s["avg_acc"] is not None and s["acc_count"] >= 5 and s["acc_coverage"] >= 30.0 and s["avg_acc"] >= 93.0:
-            signals_fire.append(f"High-velocity surge corroborated by extreme accuracy (+{s['gain']} pts, {s['win_rate']:.1f}% WR, {s['avg_acc']:.1f}% avg acc across {s['acc_count']} games)")
+            signals_fire.append(f"[Surge #{s_idx}] {s_cat} | High-velocity surge corroborated by extreme accuracy (+{s['gain']} pts, {s['win_rate']:.1f}% WR, {s['avg_acc']:.1f}% avg acc across {s['acc_count']} games) | {date_span_str}")
             if "Engine-Corroborated Rating Surge" not in primary_triggers:
                 primary_triggers.append("Engine-Corroborated Rating Surge")
         elif s["reactivation"] and s["pace_day"] >= 25.0 and s["win_rate"] >= 80.0:
-            signals_fire.append(f"Reactivation surge (+{s['gain']} pts, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day post-dormancy)")
+            signals_fire.append(f"[Surge #{s_idx}] {s_cat} | Reactivation surge (+{s['gain']} pts, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day post-dormancy) | {date_span_str}")
             if "Post-Dormancy Reactivation Surge" not in primary_triggers:
                 primary_triggers.append("Post-Dormancy Reactivation Surge")
         elif s["gain"] >= 200 and s["days"] <= 7.0 and s["pace_day"] >= 35.0 and s["win_rate"] >= 85.0:
-            signals_fire.append(f"High-velocity surge (+{s['gain']} pts in {s['days']:.1f}d at +{s['pace_day']:.1f} pts/day, {s['win_rate']:.1f}% win rate)")
+            signals_fire.append(f"[Surge #{s_idx}] {s_cat} | High-velocity macro surge (+{s['gain']} pts in {s['days']:.1f}d at +{s['pace_day']:.1f} pts/day, {s['win_rate']:.1f}% win rate) | {date_span_str}")
             if "High-Velocity Macro Surge" not in primary_triggers:
                 primary_triggers.append("High-Velocity Macro Surge")
 
     # Extensive accuracy streaks (>= 5 consecutive deep-ply wins) or corroborated streaks (>= 4 with active surge)
-    for a_streak in acc_streaks:
+    for idx_a, a_streak in enumerate(acc_streaks, start=1):
         avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
+        a_cat = a_streak[0]["time_class"].capitalize()
+        a_start_d = datetime.datetime.fromtimestamp(a_streak[0]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+        a_end_d = datetime.datetime.fromtimestamp(a_streak[-1]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+        a_date_span = f"{a_start_d}" if a_start_d == a_end_d else f"{a_start_d} -> {a_end_d}"
+
         if len(a_streak) >= 5:
-            signals_fire.append(f"Severe high-accuracy winning streak ({len(a_streak)} consecutive wins >= {args.acc_min_ply} ply, avg {avg_a:.1f}% acc)")
+            signals_fire.append(f"[Acc Streak #{idx_a}] {a_cat} | Severe high-accuracy winning streak ({len(a_streak)} consecutive wins >= {args.acc_min_ply} ply, avg {avg_a:.1f}% acc) | {a_date_span}")
             if "Severe High-Accuracy Streak" not in primary_triggers:
                 primary_triggers.append("Severe High-Accuracy Streak")
         elif len(a_streak) >= 4 and filtered_surges:
-            signals_fire.append(f"High-accuracy winning streak corroborated by surge ({len(a_streak)} consecutive wins, avg {avg_a:.1f}% acc)")
+            signals_fire.append(f"[Acc Streak #{idx_a}] {a_cat} | High-accuracy winning streak corroborated by surge ({len(a_streak)} consecutive wins, avg {avg_a:.1f}% acc) | {a_date_span}")
             if "Surge-Corroborated Accuracy Streak" not in primary_triggers:
                 primary_triggers.append("Surge-Corroborated Accuracy Streak")
 
@@ -819,9 +836,15 @@ def main():
 
     # Check for Smoke-level conditions
     for s in filtered_surges:
+        s_cat = s["category"].capitalize()
+        s_idx = s.get("surge_index", "?")
+        s_start_d = datetime.datetime.fromtimestamp(s["start_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+        s_end_d = datetime.datetime.fromtimestamp(s["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+        date_span_str = f"{s_start_d}" if s_start_d == s_end_d else f"{s_start_d} -> {s_end_d}"
+
         if s not in signals_fire:
             if 75.0 <= s["win_rate"] < 85.0 or s["pace_day"] >= 20.0:
-                signals_smoke.append(f"Elevated surge session (+{s['gain']} pts over {s['game_count']} games, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day)")
+                signals_smoke.append(f"[Surge #{s_idx}] {s_cat} | Elevated surge session (+{s['gain']} pts over {s['game_count']} games, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day) | {date_span_str}")
                 if len(filtered_surges) >= 2:
                     if "Rating Volatility / Multi-Surge Recovery" not in primary_triggers:
                         primary_triggers.append("Rating Volatility / Multi-Surge Recovery")
@@ -829,10 +852,15 @@ def main():
                     if "Isolated High-Velocity Surge" not in primary_triggers:
                         primary_triggers.append("Isolated High-Velocity Surge")
 
-    for a_streak in acc_streaks:
+    for idx_a, a_streak in enumerate(acc_streaks, start=1):
+        avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
+        a_cat = a_streak[0]["time_class"].capitalize()
+        a_start_d = datetime.datetime.fromtimestamp(a_streak[0]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+        a_end_d = datetime.datetime.fromtimestamp(a_streak[-1]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+        a_date_span = f"{a_start_d}" if a_start_d == a_end_d else f"{a_start_d} -> {a_end_d}"
+
         if len(a_streak) >= 4 and not any("high-accuracy" in f for f in signals_fire):
-            avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
-            signals_smoke.append(f"Sustained high-accuracy winning streak ({len(a_streak)} consecutive wins >= {args.acc_min_ply} ply, avg {avg_a:.1f}%)")
+            signals_smoke.append(f"[Acc Streak #{idx_a}] {a_cat} | Sustained high-accuracy winning streak ({len(a_streak)} consecutive wins >= {args.acc_min_ply} ply, avg {avg_a:.1f}%) | {a_date_span}")
             if "Sustained High-Accuracy Session" not in primary_triggers:
                 primary_triggers.append("Sustained High-Accuracy Session")
 
@@ -878,7 +906,17 @@ def main():
     gap_summary = f"{len(dormancy_events)} gaps found ({len(ext_gaps)} extended, Max: {max_gap_days} days)" if dormancy_events else "None detected"
     print(f"   - [Dormancy Gaps]       : {gap_summary}", flush=True)
 
-    print(f"   - [Surge Profile]       : {len(filtered_surges)} high-velocity surges detected", flush=True)
+    if filtered_surges:
+        surge_counts = {}
+        for s in filtered_surges:
+            c = s["category"].capitalize()
+            surge_counts[c] = surge_counts.get(c, 0) + 1
+        surge_breakdown_str = ", ".join([f"{k}: {v}" for k, v in surge_counts.items()])
+        surge_signal_str = f"{len(filtered_surges)} high-velocity surges detected ({surge_breakdown_str})"
+    else:
+        surge_signal_str = "0 high-velocity surges detected"
+    print(f"   - [Surge Profile]       : {surge_signal_str}", flush=True)
+
     print(f" Evaluation Details:", flush=True)
     for r in reasons:
         print(f"   * {r}", flush=True)
