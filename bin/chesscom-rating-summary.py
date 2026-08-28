@@ -29,9 +29,10 @@
 #   into standard (>= 30 days) and extended (>= 90 days) tiers with return
 #   session trajectory tracking (first 5 games back), and flags high-density,
 #   rapid rating surges bounded strictly by calendar time, minimum game volume,
-#   and daily velocity.
+#   and daily velocity. Provides real-time unbuffered progress feedback during
+#   archive processing across pipes and redirects.
 #
-# Version: v0.0.11
+# Version: v0.0.12
 
 import argparse
 import datetime
@@ -42,7 +43,7 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.0.11 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.0.12 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid")
@@ -70,13 +71,13 @@ def fetch_json(url):
                 return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            print(f"[-] Error: Resource not found at {url}", file=sys.stderr)
+            print(f"\n[-] Error: Resource not found at {url}", file=sys.stderr, flush=True)
         else:
-            print(f"[-] HTTP Error {e.code}: {e.reason}", file=sys.stderr)
+            print(f"\n[-] HTTP Error {e.code}: {e.reason}", file=sys.stderr, flush=True)
     except urllib.error.URLError as e:
-        print(f"[-] URL Error: {e.reason}", file=sys.stderr)
+        print(f"\n[-] URL Error: {e.reason}", file=sys.stderr, flush=True)
     except Exception as e:
-        print(f"[-] Unexpected error: {e}", file=sys.stderr)
+        print(f"\n[-] Unexpected error: {e}", file=sys.stderr, flush=True)
     return None
 
 
@@ -193,12 +194,12 @@ def main():
     archives_data = fetch_json(archives_url)
 
     if not archives_data or "archives" not in archives_data:
-        print(f"[-] Failed to retrieve archives for player: {username}", file=sys.stderr)
+        print(f"[-] Failed to retrieve archives for player: {username}", file=sys.stderr, flush=True)
         sys.exit(1)
 
     archive_urls = archives_data.get("archives", [])
     if not archive_urls:
-        print(f"[-] No game archives found for {username}.")
+        print(f"[-] No game archives found for {username}.", flush=True)
         sys.exit(0)
 
     stats = {
@@ -214,9 +215,13 @@ def main():
     category_games = {cat: [] for cat in TARGET_CATEGORIES}
 
     total_months = len(archive_urls)
-    print(f"[*] Scanning {total_months} monthly archives for '{username}'...")
+    print(f"[*] Found {total_months} monthly archives for '{username}'. Fetching...", flush=True)
 
-    for month_url in archive_urls:
+    for idx, month_url in enumerate(archive_urls, start=1):
+        parts = month_url.strip("/").split("/")
+        year_month = f"{parts[-2]}-{parts[-1]}" if len(parts) >= 2 else f"month {idx}"
+
+        print(f"\r[*] Fetching archive [{idx}/{total_months}]: {year_month}...", end="", flush=True)
         month_data = fetch_json(month_url)
         if not month_data:
             continue
@@ -289,17 +294,19 @@ def main():
             if time_class in category_games:
                 category_games[time_class].append(game_obj)
 
+    print(f"\r[*] Completed scanning {total_months} monthly archives.               \n", flush=True)
+
     # Sort chronologically by end_time
     all_rated_games.sort(key=lambda g: g["end_time"])
     for cat in TARGET_CATEGORIES:
         category_games[cat].sort(key=lambda g: g["end_time"])
 
     # Section 1: Rating Summary Output
-    print("\n" + "=" * 88)
-    print(f" RATED RATING SUMMARY: {username}")
-    print("=" * 88)
-    print(f"{'Category':<10} | {'Games':<8} | {'Rating':<8} | {'Last Played (UTC)':<20}")
-    print("-" * 88)
+    print("=" * 88, flush=True)
+    print(f" RATED RATING SUMMARY: {username}", flush=True)
+    print("=" * 88, flush=True)
+    print(f"{'Category':<10} | {'Games':<8} | {'Rating':<8} | {'Last Played (UTC)':<20}", flush=True)
+    print("-" * 88, flush=True)
 
     active_categories = {}
     for cat in TARGET_CATEGORIES:
@@ -318,9 +325,9 @@ def main():
             dt_str = "N/A"
             rating_str = "N/A"
 
-        print(f"{cat.capitalize():<10} | {count:<8} | {rating_str:<8} | {dt_str:<20}")
+        print(f"{cat.capitalize():<10} | {count:<8} | {rating_str:<8} | {dt_str:<20}", flush=True)
 
-    print("-" * 88)
+    print("-" * 88, flush=True)
 
     if len(active_categories) >= 2:
         highest_cat = max(active_categories, key=active_categories.get)
@@ -329,21 +336,21 @@ def main():
         lowest_rating = active_categories[lowest_cat]
         spread = highest_rating - lowest_rating
 
-        print(f"Highest Rated Category : {highest_cat.capitalize()} ({highest_rating})")
-        print(f"Lowest Rated Category  : {lowest_cat.capitalize()} ({lowest_rating})")
-        print(f"Rating Difference      : {spread} points")
+        print(f"Highest Rated Category : {highest_cat.capitalize()} ({highest_rating})", flush=True)
+        print(f"Lowest Rated Category  : {lowest_cat.capitalize()} ({lowest_rating})", flush=True)
+        print(f"Rating Difference      : {spread} points", flush=True)
     elif len(active_categories) == 1:
         cat, rating = next(iter(active_categories.items()))
-        print(f"Only one active rated category found: {cat.capitalize()} ({rating}). Spread not applicable.")
+        print(f"Only one active rated category found: {cat.capitalize()} ({rating}). Spread not applicable.", flush=True)
     else:
-        print("No rated games found in bullet, blitz, or rapid categories.")
+        print("No rated games found in bullet, blitz, or rapid categories.", flush=True)
 
-    print("=" * 88)
+    print("=" * 88, flush=True)
 
     # Section 2: Chronological Short-Ply Streak Detection
-    print(f"\n" + "=" * 88)
-    print(f" SUSPICIOUS SHORT-PLY STREAKS (0 < Ply <= {max_ply}, >= {min_streak} Consecutive Games)")
-    print("=" * 88)
+    print(f"\n" + "=" * 88, flush=True)
+    print(f" SUSPICIOUS SHORT-PLY STREAKS (0 < Ply <= {max_ply}, >= {min_streak} Consecutive Games)", flush=True)
+    print("=" * 88, flush=True)
 
     streaks = []
     current_streak = []
@@ -360,7 +367,7 @@ def main():
         streaks.append(list(current_streak))
 
     if not streaks:
-        print(f"No consecutive streaks of >= {min_streak} short-ply games detected.")
+        print(f"No consecutive streaks of >= {min_streak} short-ply games detected.", flush=True)
     else:
         for idx, streak in enumerate(streaks, start=1):
             wins = sum(1 for g in streak if g["outcome"] == "WIN")
@@ -369,27 +376,27 @@ def main():
             start_dt = datetime.datetime.fromtimestamp(streak[0]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             end_dt = datetime.datetime.fromtimestamp(streak[-1]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-            print(f"\n[Streak #{idx}] Length: {len(streak)} games (+{wins} -{losses} ={draws}) | {start_dt} to {end_dt} UTC")
-            print("-" * 88)
+            print(f"\n[Streak #{idx}] Length: {len(streak)} games (+{wins} -{losses} ={draws}) | {start_dt} to {end_dt} UTC", flush=True)
+            print("-" * 88, flush=True)
             for g in streak:
                 dt_str = datetime.datetime.fromtimestamp(g["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 matchup_info = f"vs {g['opponent']} ({g['player_rating']}/{g['opponent_rating']})"
-                print(f"  [{g['outcome']:<4}] {g['time_class'].capitalize():<6} | {g['ply']:>2} ply | {g['event_type']:<7} | {matchup_info:<30} | {dt_str} UTC | {g['url']}")
+                print(f"  [{g['outcome']:<4}] {g['time_class'].capitalize():<6} | {g['ply']:>2} ply | {g['event_type']:<7} | {matchup_info:<30} | {dt_str} UTC | {g['url']}", flush=True)
 
     # Section 3: Rating Trajectory, Dormancy & Surge Analysis
-    print(f"\n" + "=" * 88)
-    print(" RATING TRAJECTORY, DORMANCY & SURGE ANALYSIS")
-    print("=" * 88)
+    print(f"\n" + "=" * 88, flush=True)
+    print(" RATING TRAJECTORY, DORMANCY & SURGE ANALYSIS", flush=True)
+    print("=" * 88, flush=True)
 
     # 3A: Initial Account Onboarding
-    print(f"\n-- INITIAL ACCOUNT ONBOARDING (First {onboarding_limit} Games per Pool) " + "-" * max(0, (88 - len(f"-- INITIAL ACCOUNT ONBOARDING (First {onboarding_limit} Games per Pool) "))))
-    print(f"{'Category':<10} | {'Initial -> End':<19} | {'Delta':<8} | {'Win Rate':<9} | {'Max Streak':<11} | {'Avg Opponent':<12}")
-    print("-" * 88)
+    print(f"\n-- INITIAL ACCOUNT ONBOARDING (First {onboarding_limit} Games per Pool) " + "-" * max(0, (88 - len(f"-- INITIAL ACCOUNT ONBOARDING (First {onboarding_limit} Games per Pool) "))), flush=True)
+    print(f"{'Category':<10} | {'Initial -> End':<19} | {'Delta':<8} | {'Win Rate':<9} | {'Max Streak':<11} | {'Avg Opponent':<12}", flush=True)
+    print("-" * 88, flush=True)
 
     for cat in TARGET_CATEGORIES:
         games = category_games[cat]
         if not games:
-            print(f"{cat.capitalize():<10} | {'No games played':<19} | {'N/A':<8} | {'N/A':<9} | {'N/A':<11} | {'N/A':<12}")
+            print(f"{cat.capitalize():<10} | {'No games played':<19} | {'N/A':<8} | {'N/A':<9} | {'N/A':<11} | {'N/A':<12}", flush=True)
             continue
 
         sample = games[:onboarding_limit]
@@ -415,14 +422,14 @@ def main():
         avg_opp = sum(g["opponent_rating"] for g in sample) / sample_count if sample_count > 0 else 0
 
         rating_range_str = f"{init_rating} -> {final_rating} (#{sample_count})"
-        print(f"{cat.capitalize():<10} | {rating_range_str:<19} | {delta_str:<8} | {win_rate:>5.1f}%   | {str(max_streak_len) + ' games':<11} | {round(avg_opp):<12}")
+        print(f"{cat.capitalize():<10} | {rating_range_str:<19} | {delta_str:<8} | {win_rate:>5.1f}%   | {str(max_streak_len) + ' games':<11} | {round(avg_opp):<12}", flush=True)
 
-    print("-" * 88)
+    print("-" * 88, flush=True)
 
     # 3B: Inactivity & Dormancy Gaps
-    print(f"\n-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) " + "-" * max(0, (88 - len(f"-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) "))))
-    print(f"{'Category':<10} | {'Inactive Period (UTC)':<25} | {'Duration':<11} | {'Tier':<10} | {f'Return Trajectory (First {return_sample_games} Games)':<30}")
-    print("-" * 88)
+    print(f"\n-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) " + "-" * max(0, (88 - len(f"-- INACTIVITY & DORMANCY GAPS (Standard >= {args.dormancy_days}d, Extended >= {args.extended_dormancy_days}d) "))), flush=True)
+    print(f"{'Category':<10} | {'Inactive Period (UTC)':<25} | {'Duration':<11} | {'Tier':<10} | {f'Return Trajectory (First {return_sample_games} Games)':<30}", flush=True)
+    print("-" * 88, flush=True)
 
     dormancy_events = []
     for cat in TARGET_CATEGORIES:
@@ -470,15 +477,15 @@ def main():
                     "pre_rating": pre_rating,
                     "post_rating": g_next["player_rating"],
                 })
-                print(f"{cat.capitalize():<10} | {period_str:<25} | {str(gap_days) + ' days':<11} | {tier:<10} | {trajectory_str:<30}")
+                print(f"{cat.capitalize():<10} | {period_str:<25} | {str(gap_days) + ' days':<11} | {tier:<10} | {trajectory_str:<30}", flush=True)
 
     if not dormancy_events:
-        print(f"No inactivity gaps >= {args.dormancy_days} days detected.")
-    print("-" * 88)
+        print(f"No inactivity gaps >= {args.dormancy_days} days detected.", flush=True)
+    print("-" * 88, flush=True)
 
     # 3C: High-Velocity Surge Windows
     surge_criteria_str = f"-- HIGH-VELOCITY SURGES (Gain >= +{args.surge_min_pts} pts, >= {args.surge_min_games} games, <= {args.surge_max_days}d, >= {args.surge_min_velocity} pts/d) "
-    print(f"\n{surge_criteria_str}" + "-" * max(0, 88 - len(surge_criteria_str)))
+    print(f"\n{surge_criteria_str}" + "-" * max(0, 88 - len(surge_criteria_str)), flush=True)
 
     surges = []
     for cat in TARGET_CATEGORIES:
@@ -550,7 +557,7 @@ def main():
             filtered_surges.append(s)
 
     if not filtered_surges:
-        print(f"No high-velocity surge windows detected.")
+        print("No high-velocity surge windows detected.", flush=True)
     else:
         for idx, s in enumerate(filtered_surges, start=1):
             start_dt = datetime.datetime.fromtimestamp(s["start_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -562,20 +569,20 @@ def main():
             min_opp = min(opp_ratings) if opp_ratings else 0
             max_opp = max(opp_ratings) if opp_ratings else 0
 
-            print(f"\n[Surge #{idx}] {s['category'].capitalize()} | +{s['gain']} pts ({s['start_rating']} -> {s['end_rating']}) over {s['game_count']} games | {days_str}")
-            print(f"Record: {s['wins']} Wins, {s['losses']} Losses, {s['draws']} Draws ({win_rate:.1f}% Win Rate) | Pace: +{s['pace_game']:.1f} pts/game (+{s['pace_day']:.1f} pts/day)")
+            print(f"\n[Surge #{idx}] {s['category'].capitalize()} | +{s['gain']} pts ({s['start_rating']} -> {s['end_rating']}) over {s['game_count']} games | {days_str}", flush=True)
+            print(f"Record: {s['wins']} Wins, {s['losses']} Losses, {s['draws']} Draws ({win_rate:.1f}% Win Rate) | Pace: +{s['pace_game']:.1f} pts/game (+{s['pace_day']:.1f} pts/day)", flush=True)
 
             if s["reactivation"]:
                 gap_d = s["reactivation"]["gap_days"]
                 tier_str = s["reactivation"]["tier"]
-                print(f"Alert : REACTIVATION SURGE -> Surge began immediately after {gap_d} days of {tier_str.lower()} dormancy!")
+                print(f"Alert : REACTIVATION SURGE -> Surge began immediately after {gap_d} days of {tier_str.lower()} dormancy!", flush=True)
 
-            print("-" * 88)
-            print(f"  Start Match : {s['start_rating']} vs {s['start_game']['opponent']} ({s['start_game']['opponent_rating']}) | {start_dt} UTC")
-            print(f"  Peak Match  : {s['end_rating']} vs {s['end_game']['opponent']} ({s['end_game']['opponent_rating']}) | {end_dt} UTC")
-            print(f"  Opponents   : Avg {round(avg_opp)} rating (Min: {min_opp}, Max: {max_opp})")
+            print("-" * 88, flush=True)
+            print(f"  Start Match : {s['start_rating']} vs {s['start_game']['opponent']} ({s['start_game']['opponent_rating']}) | {start_dt} UTC", flush=True)
+            print(f"  Peak Match  : {s['end_rating']} vs {s['end_game']['opponent']} ({s['end_game']['opponent_rating']}) | {end_dt} UTC", flush=True)
+            print(f"  Opponents   : Avg {round(avg_opp)} rating (Min: {min_opp}, Max: {max_opp})", flush=True)
 
-    print("\n" + "=" * 88 + "\n")
+    print("\n" + "=" * 88 + "\n", flush=True)
 
 
 if __name__ == "__main__":
