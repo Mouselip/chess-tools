@@ -30,10 +30,11 @@
 #   session trajectory tracking (first 5 games back). Flags high-density
 #   rapid rating surges bounded strictly by calendar time, minimum game volume,
 #   daily velocity, and anomalous win rate floors, filtering out high-volume
-#   speed-pool grinding and onboarding noise. Concludes with a synthesized
-#   verdict (Human, Smoke, or Fire) evaluating fair-play risk.
+#   speed-pool grinding and onboarding noise with normalized sub-day time clamping.
+#   Concludes with a graduated synthesized verdict (Human, Smoke, or Fire)
+#   evaluating fair-play risk without jumping straight over Smoke on isolated heaters.
 #
-# Version: v0.0.17
+# Version: v0.0.18
 
 import argparse
 import datetime
@@ -44,13 +45,13 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.0.17 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.0.18 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid")
 DEFAULT_MAX_PLY = 13
 DEFAULT_MIN_STREAK = 3
-DEFAULT_ONBOARDING_GAMES = 30
+DEFAULT_ONBOARDING_GAMES = 50
 DEFAULT_RETURN_SAMPLE_GAMES = 5
 
 # Inactivity defaults
@@ -59,10 +60,10 @@ DEFAULT_EXTENDED_DORMANCY_DAYS = 90
 
 # Surge defaults
 DEFAULT_SURGE_MIN_PTS = 150
-DEFAULT_SURGE_MAX_DAYS = 7
+DEFAULT_SURGE_MAX_DAYS = 7.0
 DEFAULT_SURGE_MIN_GAMES = 15
 DEFAULT_SURGE_MIN_VELOCITY = 20.0
-DEFAULT_SURGE_IGNORE_ONBOARDING = 30
+DEFAULT_SURGE_IGNORE_ONBOARDING = 50
 DEFAULT_SURGE_MIN_WIN_RATE = 75.0
 
 
@@ -525,14 +526,17 @@ def main():
             for j in range(i + args.surge_min_games - 1, n_games):
                 end_g = games[j]
                 time_diff = end_g["end_time"] - start_g["end_time"]
-                days_diff = max(time_diff / 86400.0, 0.01)
+                actual_days = max(time_diff / 86400.0, 0.001)
 
-                if days_diff > args.surge_max_days:
+                if actual_days > args.surge_max_days:
                     break
 
                 gain = end_g["player_rating"] - start_g["player_rating"]
                 if gain >= args.surge_min_pts:
-                    velocity = gain / days_diff
+                    # Clamp velocity divisor to at least 1.0 day to avoid micro-session extrapolation spikes
+                    effective_days = max(actual_days, 1.0)
+                    velocity = gain / effective_days
+
                     if velocity >= args.surge_min_velocity:
                         window_games = games[i:j + 1]
                         wins = sum(1 for g in window_games if g["outcome"] == "WIN")
@@ -562,7 +566,7 @@ def main():
                             "game_count": len(window_games),
                             "start_time": start_g["end_time"],
                             "end_time": end_g["end_time"],
-                            "days": days_diff,
+                            "days": actual_days,
                             "wins": wins,
                             "losses": losses,
                             "draws": draws,
@@ -619,22 +623,23 @@ def main():
     signals_smoke = []
     signals_fire = []
 
-    # Check for Fire-level conditions
+    # Check for Fire-level conditions (sustained engine-level thresholds)
     for s in filtered_surges:
-        if s["reactivation"] and s["pace_day"] >= 20.0 and s["win_rate"] >= 80.0:
-            signals_fire.append(f"Reactivation surge (+{s['gain']} pts, {s['win_rate']:.1f}% win rate, {s['pace_day']:.1f} pts/day)")
-        elif s["gain"] >= 200 and s["days"] <= 7.0 and s["pace_day"] >= 25.0 and s["win_rate"] >= 75.0:
-            signals_fire.append(f"High-velocity surge (+{s['gain']} pts in {s['days']:.1f}d at {s['pace_day']:.1f} pts/day, {s['win_rate']:.1f}% win rate)")
+        if s["reactivation"] and s["pace_day"] >= 25.0 and s["win_rate"] >= 80.0:
+            signals_fire.append(f"Reactivation surge (+{s['gain']} pts, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day post-dormancy)")
+        elif s["gain"] >= 200 and s["days"] <= 7.0 and s["pace_day"] >= 35.0 and s["win_rate"] >= 85.0:
+            signals_fire.append(f"High-velocity surge (+{s['gain']} pts in {s['days']:.1f}d at +{s['pace_day']:.1f} pts/day, {s['win_rate']:.1f}% win rate)")
 
     total_short_games = sum(len(st) for st in streaks)
     max_streak_len = max([len(st) for st in streaks]) if streaks else 0
     if max_streak_len >= 5 or total_short_games >= 12:
         signals_fire.append(f"Severe short-ply streaks (Max: {max_streak_len} consecutive games, Total: {total_short_games})")
 
-    # Check for Smoke-level conditions
+    # Check for Smoke-level conditions (isolated heaters or borderline patterns)
     for s in filtered_surges:
-        if s["pace_day"] >= 15.0 and s not in signals_fire:
-            signals_smoke.append(f"Moderate surge velocity (+{s['gain']} pts at {s['pace_day']:.1f} pts/day, {s['win_rate']:.1f}% win rate)")
+        if s not in signals_fire:
+            if 75.0 <= s["win_rate"] < 85.0 or s["pace_day"] >= 20.0:
+                signals_smoke.append(f"Elevated surge session (+{s['gain']} pts over {s['game_count']} games, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day)")
 
     if len(streaks) >= 2 and not signals_fire:
         signals_smoke.append(f"Multiple short-ply streaks detected ({len(streaks)} streaks)")
