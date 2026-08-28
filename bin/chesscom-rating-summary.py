@@ -24,13 +24,15 @@
 #   Reports game counts, W-D-L records, overall score percentage, average
 #   accuracy with analysis coverage counts, latest rating, last played date
 #   per category, and rating spread. Detects suspicious streaks of consecutive
-#   short-ply games (0 < ply <= 13) and consecutive high-accuracy winning streaks
-#   (accuracy >= 96.0%, ply >= 35, 100% wins, strictly consecutive and time-bounded
+#   short-ply games (0 < ply <= 13) and sustained high-accuracy winning streaks
+#   (accuracy >= 96.0%, ply >= 45, 100% wins, strictly consecutive and time-bounded
 #   within <= 48h, live categories only). Evaluates rating trajectories, dormancy
 #   gaps, and high-velocity surges with density-gated accuracy corroboration.
-#   Concludes with a synthesized verdict (Human, Smoke, or Fire) evaluating fair-play risk.
+#   Synthesizes verdicts (Human, Smoke, or Fire) by requiring multi-signal
+#   corroboration, preventing isolated session heaters across large archives
+#   from triggering false positive synthesis flags.
 #
-# Version: v0.1.3
+# Version: v0.1.4
 
 import argparse
 import datetime
@@ -41,7 +43,7 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.1.3 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.1.4 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid", "daily")
@@ -64,8 +66,8 @@ DEFAULT_SURGE_IGNORE_ONBOARDING = 50
 DEFAULT_SURGE_MIN_WIN_RATE = 75.0
 
 # Accuracy defaults
-DEFAULT_MIN_ACC_STREAK = 3
-DEFAULT_MIN_ACC_PLY = 35
+DEFAULT_MIN_ACC_STREAK = 4
+DEFAULT_MIN_ACC_PLY = 45
 DEFAULT_ACC_STREAK_THRESHOLD = 96.0
 DEFAULT_ACC_STREAK_MAX_HOURS = 48.0
 MIN_ANALYZED_THRESHOLD = 10
@@ -524,7 +526,7 @@ def main():
                             acc_streaks.append(list(current_acc_streak))
                         current_acc_streak = [g]
                 else:
-                    current_acc_streak.append(g)
+                    current_acc_streak = [g]
             else:
                 if len(current_acc_streak) >= args.acc_min_streak:
                     acc_streaks.append(list(current_acc_streak))
@@ -789,10 +791,13 @@ def main():
         elif s["gain"] >= 200 and s["days"] <= 7.0 and s["pace_day"] >= 35.0 and s["win_rate"] >= 85.0:
             signals_fire.append(f"High-velocity surge (+{s['gain']} pts in {s['days']:.1f}d at +{s['pace_day']:.1f} pts/day, {s['win_rate']:.1f}% win rate)")
 
+    # Extensive accuracy streaks (>= 5 consecutive deep-ply wins) or corroborated streaks (>= 4 with active surge)
     for a_streak in acc_streaks:
-        if len(a_streak) >= 4:
-            avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
-            signals_fire.append(f"Extensive high-accuracy winning streak ({len(a_streak)} consecutive wins, avg {avg_a:.1f}% acc)")
+        avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
+        if len(a_streak) >= 5:
+            signals_fire.append(f"Severe high-accuracy winning streak ({len(a_streak)} consecutive wins >= {args.acc_min_ply} ply, avg {avg_a:.1f}% acc)")
+        elif len(a_streak) >= 4 and filtered_surges:
+            signals_fire.append(f"High-accuracy winning streak corroborated by surge ({len(a_streak)} consecutive wins, avg {avg_a:.1f}% acc)")
 
     total_short_games = sum(len(st) for st in streaks)
     max_streak_len = max([len(st) for st in streaks]) if streaks else 0
@@ -806,9 +811,9 @@ def main():
                 signals_smoke.append(f"Elevated surge session (+{s['gain']} pts over {s['game_count']} games, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day)")
 
     for a_streak in acc_streaks:
-        if len(a_streak) == 3 and not any("high-accuracy winning streak" in f for f in signals_fire):
+        if len(a_streak) >= 4 and not any("high-accuracy" in f for f in signals_fire):
             avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
-            signals_smoke.append(f"High-accuracy winning streak ({len(a_streak)} consecutive wins >= {args.acc_threshold:.1f}% acc, avg {avg_a:.1f}%)")
+            signals_smoke.append(f"Sustained high-accuracy winning streak ({len(a_streak)} consecutive wins >= {args.acc_min_ply} ply, avg {avg_a:.1f}%)")
 
     if len(streaks) >= 2 and not signals_fire:
         signals_smoke.append(f"Multiple short-ply streaks detected ({len(streaks)} streaks)")
@@ -821,7 +826,7 @@ def main():
         reasons = signals_smoke
     else:
         verdict = "Human"
-        reasons = ["Rating progression and volume profiles align with standard organic play."]
+        reasons = ["Rating progression, accuracy distribution, and volume profiles align with standard organic play."]
 
     print("\n" + "=" * 102, flush=True)
     print(" FINAL FORENSIC SYNTHESIS", flush=True)
