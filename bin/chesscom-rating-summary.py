@@ -21,21 +21,21 @@
 #   Scans the Chess.com public archives for a target player, filtering
 #   for rated games across bullet, blitz, rapid, and daily categories.
 #   Retrieves player profile metadata to report account status at the top.
-#   Reports game counts, latest rating, last played date per category, and
-#   the rating spread between highest and lowest categories. Detects
-#   suspicious streaks of consecutive short-ply games (0 < ply <= 13)
-#   regardless of opponent to identify rating farming, sandbagging, or
-#   rapid rating dumping with event categorization and dual player/opponent
-#   ratings. Evaluates rating trajectories by categorizing dormancy gaps
-#   into standard (>= 30 days) and extended (>= 90 days) tiers with return
-#   session trajectory tracking (first 5 games back). Flags high-density
-#   rapid rating surges bounded strictly by calendar time, minimum game volume,
-#   daily velocity, and anomalous win rate floors, filtering out high-volume
-#   speed-pool grinding and onboarding noise with normalized sub-day time clamping.
-#   Concludes with a graduated synthesized verdict (Human, Smoke, or Fire)
-#   evaluating fair-play risk.
+#   Reports game counts, W-D-L records, overall score percentage (Wins + 0.5*Draws),
+#   latest rating, last played date per category, and the rating spread
+#   between highest and lowest categories. Detects suspicious streaks of
+#   consecutive short-ply games (0 < ply <= 13) regardless of opponent to
+#   identify rating farming, sandbagging, or rapid rating dumping with event
+#   categorization and dual player/opponent ratings. Evaluates rating
+#   trajectories by categorizing dormancy gaps into standard (>= 30 days) and
+#   extended (>= 90 days) tiers with return session trajectory tracking (first 5
+#   games back). Flags high-density rapid rating surges bounded strictly by
+#   calendar time, minimum game volume, daily velocity, and anomalous win rate
+#   floors, filtering out high-volume speed-pool grinding and onboarding noise
+#   with normalized sub-day time clamping. Concludes with a graduated synthesized
+#   verdict (Human, Smoke, or Fire) evaluating fair-play risk.
 #
-# Version: v0.1.0
+# Version: v0.1.1
 
 import argparse
 import datetime
@@ -46,7 +46,7 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.1.0 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.1.1 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid", "daily")
@@ -236,6 +236,9 @@ def main():
     stats = {
         cat: {
             "count": 0,
+            "wins": 0,
+            "draws": 0,
+            "losses": 0,
             "latest_rating": None,
             "last_played_ts": 0,
         }
@@ -291,9 +294,23 @@ def main():
 
             end_time = game.get("end_time", 0)
 
+            if player_result == "win":
+                outcome = "WIN"
+            elif player_result in ("agreed", "repetition", "stalemate", "timevsinsufficient", "insufficient"):
+                outcome = "DRAW"
+            else:
+                outcome = "LOSS"
+
             # Category stats tracking
             if time_class in stats:
                 stats[time_class]["count"] += 1
+                if outcome == "WIN":
+                    stats[time_class]["wins"] += 1
+                elif outcome == "DRAW":
+                    stats[time_class]["draws"] += 1
+                else:
+                    stats[time_class]["losses"] += 1
+
                 if end_time >= stats[time_class]["last_played_ts"]:
                     stats[time_class]["last_played_ts"] = end_time
                     stats[time_class]["latest_rating"] = player_rating
@@ -303,13 +320,6 @@ def main():
             ply_count = count_ply_from_pgn(pgn)
             event_type = extract_event_type(pgn)
             game_url = game.get("url", "")
-
-            if player_result == "win":
-                outcome = "WIN"
-            elif player_result in ("agreed", "repetition", "stalemate", "timevsinsufficient", "insufficient"):
-                outcome = "DRAW"
-            else:
-                outcome = "LOSS"
 
             game_obj = {
                 "end_time": end_time,
@@ -341,13 +351,16 @@ def main():
     title_str = f" [{player_title}]" if player_title else ""
     print(f" RATED RATING SUMMARY: {username}{title_str} | Status: {account_status}", flush=True)
     print("=" * 88, flush=True)
-    print(f"{'Category':<10} | {'Games':<8} | {'Rating':<8} | {'Last Played (UTC)':<20}", flush=True)
+    print(f"{'Category':<10} | {'Games':<8} | {'W-D-L':<15} | {'Score %':<9} | {'Rating':<8} | {'Last Played (UTC)':<20}", flush=True)
     print("-" * 88, flush=True)
 
     active_categories = {}
     for cat in TARGET_CATEGORIES:
         data = stats[cat]
         count = data["count"]
+        w = data["wins"]
+        d = data["draws"]
+        l = data["losses"]
         rating = data["latest_rating"]
         ts = data["last_played_ts"]
 
@@ -356,12 +369,17 @@ def main():
                 "%Y-%m-%d %H:%M:%S"
             )
             rating_str = str(rating)
+            wdl_str = f"{w}-{d}-{l}"
+            score_pct = ((w + 0.5 * d) / count) * 100.0
+            score_str = f"{score_pct:>5.1f}%"
             active_categories[cat] = rating
         else:
             dt_str = "N/A"
             rating_str = "N/A"
+            wdl_str = "N/A"
+            score_str = "N/A"
 
-        print(f"{cat.capitalize():<10} | {count:<8} | {rating_str:<8} | {dt_str:<20}", flush=True)
+        print(f"{cat.capitalize():<10} | {count:<8} | {wdl_str:<15} | {score_str:<9} | {rating_str:<8} | {dt_str:<20}", flush=True)
 
     print("-" * 88, flush=True)
 
