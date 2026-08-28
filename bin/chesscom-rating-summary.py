@@ -28,11 +28,11 @@
 #   (accuracy >= 96.0%, ply >= 45, 100% wins, strictly consecutive and time-bounded
 #   within <= 48h, live categories only). Evaluates rating trajectories, dormancy
 #   gaps, and high-velocity surges with density-gated accuracy corroboration.
-#   Synthesizes verdicts (Human, Smoke, or Fire) by requiring multi-signal
-#   corroboration, preventing isolated session heaters across large archives
-#   from triggering false positive synthesis flags.
+#   Synthesizes verdicts (Human, Smoke, or Fire) with explicit forensic trigger
+#   attribution and context categorization (e.g., Rating Volatility / Recovery,
+#   Engine Assistance, Short-Ply Dumping).
 #
-# Version: v0.1.4
+# Version: v0.1.5
 
 import argparse
 import datetime
@@ -43,7 +43,7 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.1.4 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.1.5 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid", "daily")
@@ -526,7 +526,7 @@ def main():
                             acc_streaks.append(list(current_acc_streak))
                         current_acc_streak = [g]
                 else:
-                    current_acc_streak = [g]
+                    current_acc_streak.append(g)
             else:
                 if len(current_acc_streak) >= args.acc_min_streak:
                     acc_streaks.append(list(current_acc_streak))
@@ -780,43 +780,66 @@ def main():
     reasons = []
     signals_smoke = []
     signals_fire = []
+    primary_triggers = []
 
     # Check for Fire-level conditions
     for s in filtered_surges:
         # Surge with high accuracy corroboration
         if s["avg_acc"] is not None and s["acc_count"] >= 5 and s["acc_coverage"] >= 30.0 and s["avg_acc"] >= 93.0:
             signals_fire.append(f"High-velocity surge corroborated by extreme accuracy (+{s['gain']} pts, {s['win_rate']:.1f}% WR, {s['avg_acc']:.1f}% avg acc across {s['acc_count']} games)")
+            if "Engine-Corroborated Rating Surge" not in primary_triggers:
+                primary_triggers.append("Engine-Corroborated Rating Surge")
         elif s["reactivation"] and s["pace_day"] >= 25.0 and s["win_rate"] >= 80.0:
             signals_fire.append(f"Reactivation surge (+{s['gain']} pts, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day post-dormancy)")
+            if "Post-Dormancy Reactivation Surge" not in primary_triggers:
+                primary_triggers.append("Post-Dormancy Reactivation Surge")
         elif s["gain"] >= 200 and s["days"] <= 7.0 and s["pace_day"] >= 35.0 and s["win_rate"] >= 85.0:
             signals_fire.append(f"High-velocity surge (+{s['gain']} pts in {s['days']:.1f}d at +{s['pace_day']:.1f} pts/day, {s['win_rate']:.1f}% win rate)")
+            if "High-Velocity Macro Surge" not in primary_triggers:
+                primary_triggers.append("High-Velocity Macro Surge")
 
     # Extensive accuracy streaks (>= 5 consecutive deep-ply wins) or corroborated streaks (>= 4 with active surge)
     for a_streak in acc_streaks:
         avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
         if len(a_streak) >= 5:
             signals_fire.append(f"Severe high-accuracy winning streak ({len(a_streak)} consecutive wins >= {args.acc_min_ply} ply, avg {avg_a:.1f}% acc)")
+            if "Severe High-Accuracy Streak" not in primary_triggers:
+                primary_triggers.append("Severe High-Accuracy Streak")
         elif len(a_streak) >= 4 and filtered_surges:
             signals_fire.append(f"High-accuracy winning streak corroborated by surge ({len(a_streak)} consecutive wins, avg {avg_a:.1f}% acc)")
+            if "Surge-Corroborated Accuracy Streak" not in primary_triggers:
+                primary_triggers.append("Surge-Corroborated Accuracy Streak")
 
     total_short_games = sum(len(st) for st in streaks)
     max_streak_len = max([len(st) for st in streaks]) if streaks else 0
     if max_streak_len >= 5 or total_short_games >= 12:
         signals_fire.append(f"Severe short-ply streaks (Max: {max_streak_len} consecutive games, Total: {total_short_games})")
+        if "Severe Short-Ply Rating Dumping/Farming" not in primary_triggers:
+            primary_triggers.append("Severe Short-Ply Rating Dumping/Farming")
 
     # Check for Smoke-level conditions
     for s in filtered_surges:
         if s not in signals_fire:
             if 75.0 <= s["win_rate"] < 85.0 or s["pace_day"] >= 20.0:
                 signals_smoke.append(f"Elevated surge session (+{s['gain']} pts over {s['game_count']} games, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day)")
+                if len(filtered_surges) >= 2:
+                    if "Rating Volatility / Multi-Surge Recovery" not in primary_triggers:
+                        primary_triggers.append("Rating Volatility / Multi-Surge Recovery")
+                else:
+                    if "Isolated High-Velocity Surge" not in primary_triggers:
+                        primary_triggers.append("Isolated High-Velocity Surge")
 
     for a_streak in acc_streaks:
         if len(a_streak) >= 4 and not any("high-accuracy" in f for f in signals_fire):
             avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
             signals_smoke.append(f"Sustained high-accuracy winning streak ({len(a_streak)} consecutive wins >= {args.acc_min_ply} ply, avg {avg_a:.1f}%)")
+            if "Sustained High-Accuracy Session" not in primary_triggers:
+                primary_triggers.append("Sustained High-Accuracy Session")
 
     if len(streaks) >= 2 and not signals_fire:
         signals_smoke.append(f"Multiple short-ply streaks detected ({len(streaks)} streaks)")
+        if "Moderate Short-Ply Activity" not in primary_triggers:
+            primary_triggers.append("Moderate Short-Ply Activity")
 
     if signals_fire:
         verdict = "Fire"
@@ -826,12 +849,14 @@ def main():
         reasons = signals_smoke
     else:
         verdict = "Human"
+        primary_triggers = ["None (Clean Organic Baseline)"]
         reasons = ["Rating progression, accuracy distribution, and volume profiles align with standard organic play."]
 
     print("\n" + "=" * 102, flush=True)
     print(" FINAL FORENSIC SYNTHESIS", flush=True)
     print("=" * 102, flush=True)
     print(f" Verdict         : {verdict}", flush=True)
+    print(f" Trigger Category: {', '.join(primary_triggers)}", flush=True)
     print(f" Primary Signals :", flush=True)
     streak_summary = f"{len(streaks)} streaks found (Max: {max_streak_len} games, Total: {total_short_games} games)" if streaks else "None detected"
     print(f"   - [Short-Ply Streaks]   : {streak_summary}", flush=True)
