@@ -28,13 +28,14 @@
 #   spread. Detects suspicious streaks of consecutive short-ply games
 #   (0 < ply <= 13) and sustained high-accuracy winning streaks (accuracy >= 96.0%,
 #   ply >= 45, 100% wins, strictly consecutive and time-bounded within <= 48h,
-#   live categories only). Evaluates rating trajectories, dormancy gaps, and
-#   high-velocity surges with density-gated accuracy corroboration.
+#   live categories only). Evaluates rating trajectories, dormancy gaps,
+#   rating landslides / sandbagging / tilt spirals, and high-velocity surges
+#   with density-gated accuracy corroboration.
 #   Synthesizes graduated verdicts (Human, Smoke, or Fire) with explicit category
 #   names, dates in evaluation details, clear trigger attribution, and pool breakdowns.
 #   Includes robust HTTP 429/transient retry backoff and an optional User-Agent CLI flag.
 #
-# Version: v1.1.0
+# Version: v1.2.0
 
 import argparse
 import datetime
@@ -45,7 +46,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "v1.1.0"
+VERSION = "v1.2.0"
 DEFAULT_REPO_URL = "https://github.com/Mouselip/chess-tools"
 
 # Pool and category filters
@@ -71,6 +72,18 @@ SURGE_MIN_GAMES = 15
 SURGE_MIN_VELOCITY = 20.0
 SURGE_IGNORE_ONBOARDING = 50
 SURGE_MIN_WIN_RATE = 75.0
+
+# Rating landslide / sandbagging detection thresholds per pool
+LANDSLIDE_THRESHOLDS = {
+    "bullet": {"min_pts": 200, "min_games": 25, "max_days": 7.0, "min_loss_rate": 75.0},
+    "blitz":  {"min_pts": 150, "min_games": 15, "max_days": 7.0, "min_loss_rate": 75.0},
+    "rapid":  {"min_pts": 120, "min_games": 10, "max_days": 7.0, "min_loss_rate": 75.0},
+    "daily":  {"min_pts": 120, "min_games": 10, "max_days": 14.0, "min_loss_rate": 75.0},
+}
+FAST_DUMP_MIN_PTS = 100
+FAST_DUMP_MIN_GAMES = 8
+FAST_DUMP_SHORT_PLY_RATIO = 0.50
+FAST_DUMP_MIN_LOSS_RATE = 85.0
 
 # High-accuracy winning streak constants
 MIN_ACC_STREAK = 4
@@ -168,7 +181,7 @@ def count_material_deficit(fen, is_white):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scan Chess.com archives for rated games, summaries, short-ply streaks, accuracy winning streaks, dormancy gaps, and surges."
+        description="Scan Chess.com archives for rated games, summaries, short-ply streaks, accuracy winning streaks, dormancy gaps, landslides/sandbagging, and surges."
     )
     parser.add_argument("username", help="Chess.com target username")
     parser.add_argument(
@@ -291,6 +304,10 @@ def main():
             else:
                 outcome = "LOSS"
 
+            is_w = (player_color == "white")
+            is_abandoned_loss = (outcome == "LOSS" and player_result == "abandoned")
+            is_deficit_abandon = is_abandoned_loss and count_material_deficit(game.get("fen", ""), is_w)
+
             if time_class in stats:
                 stats[time_class]["count"] += 1
                 if outcome == "WIN":
@@ -299,10 +316,9 @@ def main():
                     stats[time_class]["draws"] += 1
                 else:
                     stats[time_class]["losses"] += 1
-                    if player_result == "abandoned":
+                    if is_abandoned_loss:
                         stats[time_class]["abandoned_total"] += 1
-                        is_w = (player_color == "white")
-                        if count_material_deficit(game.get("fen", ""), is_w):
+                        if is_deficit_abandon:
                             stats[time_class]["abandoned_deficit"] += 1
 
                 if player_acc is not None:
@@ -330,6 +346,8 @@ def main():
                 "opponent_rating": opponent_rating if opponent_rating is not None else 0,
                 "player_rating": player_rating if player_rating is not None else 0,
                 "url": game_url,
+                "is_abandoned": is_abandoned_loss,
+                "is_deficit_abandon": is_deficit_abandon,
             }
 
             all_rated_games.append(game_obj)
@@ -732,6 +750,136 @@ def main():
             print(f"  Peak Match  : {s['end_rating']} vs {s['end_game']['opponent']} ({s['end_game']['opponent_rating']}) | {end_dt} UTC", flush=True)
             print(f"  Opponents   : Avg {round(avg_opp)} rating (Min: {min_opp}, Max: {max_opp})", flush=True)
 
+    # Section 4D: Rating Landslides & Sandbagging Analysis
+    landslides_header_str = "-- RATING LANDSLIDES & SANDBAGGING (Pool-Gated / Fast-Dump Thresholds) "
+    print(f"\n{landslides_header_str}" + "-" * max(0, 102 - len(landslides_header_str)), flush=True)
+
+    landslides = []
+    for cat in TARGET_CATEGORIES:
+        games = category_games[cat]
+        n_games = len(games)
+        cfg = LANDSLIDE_THRESHOLDS.get(cat, LANDSLIDE_THRESHOLDS["blitz"])
+        min_p = cfg["min_pts"]
+        min_g = cfg["min_games"]
+        max_d = cfg["max_days"]
+        min_lr = cfg["min_loss_rate"]
+
+        start_bound = max(0, SURGE_IGNORE_ONBOARDING)
+        for i in range(start_bound, n_games):
+            start_g = games[i]
+            for j in range(i + min(FAST_DUMP_MIN_GAMES, min_g) - 1, n_games):
+                end_g = games[j]
+                time_diff = end_g["end_time"] - start_g["end_time"]
+                actual_days = max(time_diff / 86400.0, 0.001)
+
+                if actual_days > max_d:
+                    break
+
+                drop = start_g["player_rating"] - end_g["player_rating"]
+                if drop <= 0:
+                    continue
+
+                window_games = games[i:j + 1]
+                w_count = len(window_games)
+                wins = sum(1 for g in window_games if g["outcome"] == "WIN")
+                losses = sum(1 for g in window_games if g["outcome"] == "LOSS")
+                draws = sum(1 for g in window_games if g["outcome"] == "DRAW")
+                loss_rate = (losses / w_count) * 100.0
+
+                short_ply_count = sum(1 for g in window_games if 0 < g["ply"] <= MAX_PLY)
+                short_ply_ratio = short_ply_count / w_count if w_count > 0 else 0.0
+                abandoned_deficit_count = sum(1 for g in window_games if g.get("is_deficit_abandon", False))
+
+                # Check Macro Landslide vs Fast Short-Ply Dump
+                is_macro = (drop >= min_p and w_count >= min_g and loss_rate >= min_lr)
+                is_fast_dump = (drop >= FAST_DUMP_MIN_PTS and w_count >= FAST_DUMP_MIN_GAMES and short_ply_ratio >= FAST_DUMP_SHORT_PLY_RATIO and loss_rate >= FAST_DUMP_MIN_LOSS_RATE)
+
+                if not (is_macro or is_fast_dump):
+                    continue
+
+                effective_days = max(actual_days, 1.0)
+                velocity = drop / effective_days
+                pace_game = drop / (w_count - 1) if w_count > 1 else drop
+                avg_ply = sum(g["ply"] for g in window_games) / w_count if w_count > 0 else 0.0
+
+                # Precursor check: Did this landslide bottom out directly before a surge?
+                precursor_surge = None
+                for s in filtered_surges:
+                    if s["category"] == cat and 0 <= (s["start_time"] - end_g["end_time"]) <= (14 * 86400):
+                        precursor_surge = s
+                        break
+
+                # Classification label
+                if is_fast_dump or short_ply_ratio >= 0.40 or avg_ply < 15.0:
+                    classifier = "EXPLICIT DUMP"
+                    classifier_desc = "EXPLICIT RATING DUMP -> High concentration of rapid short-ply resignations/aborts."
+                elif precursor_surge is not None:
+                    classifier = "REBOUND DUMP / CYCLE"
+                    classifier_desc = f"MANIPULATED SANDBAG/SURGE CYCLE -> Landslide served as deflated floor directly preceding Surge #{precursor_surge.get('surge_index', '?')}."
+                else:
+                    classifier = "TILT SPIRAL"
+                    classifier_desc = "ORGANIC TILT / SLUMP -> Full-length games with normal move counts."
+
+                landslides.append({
+                    "category": cat,
+                    "drop": drop,
+                    "start_rating": start_g["player_rating"],
+                    "end_rating": end_g["player_rating"],
+                    "game_count": w_count,
+                    "start_time": start_g["end_time"],
+                    "end_time": end_g["end_time"],
+                    "days": actual_days,
+                    "wins": wins,
+                    "losses": losses,
+                    "draws": draws,
+                    "loss_rate": loss_rate,
+                    "pace_game": pace_game,
+                    "pace_day": velocity,
+                    "start_game": start_g,
+                    "end_game": end_g,
+                    "window_games": window_games,
+                    "short_ply_count": short_ply_count,
+                    "short_ply_ratio": short_ply_ratio,
+                    "avg_ply": avg_ply,
+                    "abandoned_deficit": abandoned_deficit_count,
+                    "precursor_surge": precursor_surge,
+                    "classifier": classifier,
+                    "classifier_desc": classifier_desc,
+                })
+
+    landslides.sort(key=lambda l: l["start_time"])
+    filtered_landslides = []
+    for l in landslides:
+        if not filtered_landslides:
+            filtered_landslides.append(l)
+            continue
+        prev = filtered_landslides[-1]
+        if l["category"] == prev["category"] and l["start_time"] <= prev["end_time"]:
+            if l["drop"] > prev["drop"]:
+                filtered_landslides[-1] = l
+        else:
+            filtered_landslides.append(l)
+
+    if not filtered_landslides:
+        print("No high-velocity rating landslides detected.", flush=True)
+    else:
+        for idx, l in enumerate(filtered_landslides, start=1):
+            l["landslide_index"] = idx
+            start_dt = datetime.datetime.fromtimestamp(l["start_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            end_dt = datetime.datetime.fromtimestamp(l["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            days_str = f"{l['days']:.1f} days" if l['days'] >= 1.0 else f"{round(l['days'] * 24, 1)} hours"
+
+            print(f"\n[Landslide #{idx}] {l['category'].capitalize()} | -{l['drop']} pts ({l['start_rating']} -> {l['end_rating']}) over {l['game_count']} games | {days_str}", flush=True)
+            print(f"Record: {l['wins']} Wins, {l['losses']} Losses, {l['draws']} Draws ({l['loss_rate']:.1f}% Loss Rate) | Pace: -{l['pace_game']:.1f} pts/game (-{l['pace_day']:.1f} pts/day)", flush=True)
+            print(f"Dump Telemetry: {l['short_ply_count']}/{l['game_count']} Short-Ply games (Avg: {l['avg_ply']:.1f} ply) | Abandoned/Deficit: {l['abandoned_deficit']} games", flush=True)
+            print(f"Alert : [{l['classifier']}] -> {l['classifier_desc']}", flush=True)
+            print("-" * 102, flush=True)
+            print(f"  Start Match : {l['start_rating']} vs {l['start_game']['opponent']} ({l['start_game']['opponent_rating']}) | {start_dt} UTC", flush=True)
+            print(f"  Trough Match: {l['end_rating']} vs {l['end_game']['opponent']} ({l['end_game']['opponent_rating']}) | {end_dt} UTC", flush=True)
+            if l["precursor_surge"]:
+                gap_days = (l["precursor_surge"]["start_time"] - l["end_time"]) / 86400.0
+                print(f"  Precursor   : Occurred {gap_days:.1f} days prior to Surge #{l['precursor_surge'].get('surge_index', '?')} (+{l['precursor_surge']['gain']} pts)", flush=True)
+
     # Section 5: Forensic Synthesis & Verdict Determination
     reasons = []
     signals_smoke = []
@@ -758,6 +906,28 @@ def main():
             signals_fire.append(f"[Surge #{s_idx}] {s_cat} | High-velocity macro surge (+{s['gain']} pts in {s['days']:.1f}d at +{s['pace_day']:.1f} pts/day, {s['win_rate']:.1f}% win rate) | {date_span_str}")
             if "High-Velocity Macro Surge" not in primary_triggers:
                 primary_triggers.append("High-Velocity Macro Surge")
+
+    # Landslide / Sandbagging Fire & Smoke Signals
+    for l in filtered_landslides:
+        l_cat = l["category"].capitalize()
+        l_idx = l.get("landslide_index", "?")
+        l_start_d = datetime.datetime.fromtimestamp(l["start_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+        l_end_d = datetime.datetime.fromtimestamp(l["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+        date_span_str = f"{l_start_d}" if l_start_d == l_end_d else f"{l_start_d} -> {l_end_d}"
+
+        if l["classifier"] == "EXPLICIT DUMP":
+            signals_fire.append(f"[Landslide #{l_idx}] {l_cat} | Explicit short-ply rating dump (-{l["drop"]} pts in {l['days']:.1f}d, {l['short_ply_count']} short-ply games) | {date_span_str}")
+            if "Explicit Short-Ply Rating Dumping" not in primary_triggers:
+                primary_triggers.append("Explicit Short-Ply Rating Dumping")
+        elif l["classifier"] == "REBOUND DUMP / CYCLE":
+            s_idx = l["precursor_surge"].get("surge_index", "?")
+            signals_fire.append(f"[Landslide #{l_idx}] {l_cat} | Sandbagging-surge cycle (-{l['drop']} pts dump serving as baseline for Surge #{s_idx}) | {date_span_str}")
+            if "Sandbagging-Surge Cycle" not in primary_triggers:
+                primary_triggers.append("Sandbagging-Surge Cycle")
+        else:
+            signals_smoke.append(f"[Landslide #{l_idx}] {l_cat} | High-velocity tilt spiral / slump (-{l['drop']} pts over {l['game_count']} games, {l['loss_rate']:.1f}% loss rate) | {date_span_str}")
+            if "High-Velocity Tilt Spiral / Slump" not in primary_triggers:
+                primary_triggers.append("High-Velocity Tilt Spiral / Slump")
 
     for idx_a, a_streak in enumerate(acc_streaks, start=1):
         avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
@@ -853,6 +1023,15 @@ def main():
     max_gap_days = max([d["gap_days"] for d in dormancy_events]) if dormancy_events else 0
     gap_summary = f"{len(dormancy_events)} gaps found ({len(ext_gaps)} extended, Max: {max_gap_days} days)" if dormancy_events else "None detected"
     print(f"   - [Dormancy Gaps]       : {gap_summary}", flush=True)
+
+    if filtered_landslides:
+        dumps = sum(1 for l in filtered_landslides if l["classifier"] == "EXPLICIT DUMP")
+        cycles = sum(1 for l in filtered_landslides if l["classifier"] == "REBOUND DUMP / CYCLE")
+        tilts = sum(1 for l in filtered_landslides if l["classifier"] == "TILT SPIRAL")
+        landslide_signal_str = f"{len(filtered_landslides)} landslides detected ({dumps} dumps, {cycles} cycles, {tilts} tilt slides)"
+    else:
+        landslide_signal_str = "None detected"
+    print(f"   - [Landslide Profile]   : {landslide_signal_str}", flush=True)
 
     if filtered_surges:
         surge_counts = {}
