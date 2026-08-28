@@ -21,11 +21,11 @@
 #   for rated games in bullet, blitz, and rapid categories. Reports
 #   game counts, latest rating, last played date per category, and the
 #   rating spread between highest and lowest categories. Additionally
-#   detects suspicious streaks of consecutive short-ply games (<= 13 ply)
+#   detects suspicious streaks of consecutive short-ply games (0 < ply <= 13)
 #   regardless of opponent to identify rating farming, sandbagging, or
 #   rapid rating dumping, including win/loss breakdown on the streak header.
 #
-# Version: v0.0.6
+# Version: v0.0.7
 
 import argparse
 import datetime
@@ -36,7 +36,7 @@ import urllib.error
 import urllib.request
 
 HEADERS = {
-    "User-Agent": "chesscom-rating-summary/0.0.6 (Contact: GitHub/Mouselip)"
+    "User-Agent": "chesscom-rating-summary/0.0.7 (Contact: GitHub/Mouselip)"
 }
 
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid")
@@ -249,14 +249,14 @@ def main():
 
     # Section 2: Chronological Short-Ply Streak Detection
     print(f"\n" + "=" * 62)
-    print(f" SUSPICIOUS SHORT-PLY STREAKS (<= {max_ply} Ply, >= {min_streak} Consecutive Games)")
+    print(f" SUSPICIOUS SHORT-PLY STREAKS (0 < Ply <= {max_ply}, >= {min_streak} Consecutive Games)")
     print("=" * 62)
 
     streaks = []
     current_streak = []
 
     for game in all_rated_games:
-        if game["ply"] <= max_ply:
+        if 0 < game["ply"] <= max_ply:
             current_streak.append(game)
         else:
             if len(current_streak) >= min_streak:
