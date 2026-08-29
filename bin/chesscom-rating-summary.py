@@ -30,14 +30,14 @@
 #   streaks (accuracy >= 96.0%, ply >= 45, 100% wins, strictly consecutive and
 #   time-bounded within <= 48h, live categories only). Evaluates rating trajectories,
 #   dormancy gaps, rating landslides / sandbagging / tilt spirals, and high-velocity
-#   surges with density-gated accuracy corroboration. Applies a 2-year recency lookback
-#   window for active verdicts (Smoke/Fire) while segregating older triggers into
-#   historical context.
+#   surges with density-gated accuracy corroboration and cross-pool rating ceiling
+#   congruence suppression. Applies a 2-year recency lookback window for active
+#   verdicts (Smoke/Fire) while segregating older triggers into historical context.
 #   Synthesizes graduated verdicts (Human, Smoke, or Fire) with explicit category
 #   names, dates in evaluation details, clear trigger attribution, and pool breakdowns.
 #   Includes robust HTTP 429/transient retry backoff and an optional User-Agent CLI flag.
 #
-# Version: v1.3.0
+# Version: v1.2.2
 
 import argparse
 import datetime
@@ -48,7 +48,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "v1.3.0"
+VERSION = "v1.2.2"
 DEFAULT_REPO_URL = "https://github.com/Mouselip/chess-tools"
 
 # Pool and category filters
@@ -77,6 +77,7 @@ SURGE_MIN_GAMES = 15
 SURGE_MIN_VELOCITY = 20.0
 SURGE_IGNORE_ONBOARDING = 50
 SURGE_MIN_WIN_RATE = 75.0
+CONGRUENCE_TOLERANCE_PTS = 50
 
 # Rating landslide / sandbagging detection thresholds per pool
 LANDSLIDE_THRESHOLDS = {
@@ -890,9 +891,12 @@ def main():
                 gap_days = (l["precursor_surge"]["start_time"] - l["end_time"]) / 86400.0
                 print(f"  Precursor   : Occurred {gap_days:.1f} days prior to Surge #{l['precursor_surge'].get('surge_index', '?')} (+{l['precursor_surge']['gain']} pts)", flush=True)
 
-    # Section 5: Forensic Synthesis & Verdict Determination (With Recency Decay)
+    # Section 5: Forensic Synthesis & Verdict Determination (With Recency Decay & Pool Congruence)
     latest_game_ts = max((g["end_time"] for g in all_rated_games), default=time.time())
     recency_cutoff_ts = latest_game_ts - RECENCY_LOOKBACK_SECONDS
+
+    # Calculate highest active rating across other live categories for pool congruence check
+    live_ratings = {cat: stats[cat]["latest_rating"] for cat in LIVE_CATEGORIES if stats[cat]["latest_rating"] is not None}
 
     signals_smoke = []
     signals_fire = []
@@ -907,6 +911,10 @@ def main():
         s_end_d = datetime.datetime.fromtimestamp(s["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
         date_span_str = f"{s_start_d}" if s_start_d == s_end_d else f"{s_start_d} -> {s_end_d}"
         is_recent = (s["end_time"] >= recency_cutoff_ts)
+
+        # Cross-pool rating ceiling check
+        other_live_max = max([r for c, r in live_ratings.items() if c != s["category"]], default=0)
+        is_congruent_with_pool = (s["end_rating"] <= (other_live_max + CONGRUENCE_TOLERANCE_PTS)) if other_live_max > 0 else False
 
         if s["avg_acc"] is not None and s["acc_count"] >= 5 and s["acc_coverage"] >= 30.0 and s["avg_acc"] >= 93.0:
             sig_text = f"[Surge #{s_idx}] {s_cat} | High-velocity surge corroborated by extreme accuracy (+{s['gain']} pts, {s['win_rate']:.1f}% WR, {s['avg_acc']:.1f}% avg acc across {s['acc_count']} games) | {date_span_str}"
@@ -935,13 +943,16 @@ def main():
         elif 75.0 <= s["win_rate"] < 85.0 or s["pace_day"] >= 20.0:
             sig_text = f"[Surge #{s_idx}] {s_cat} | Elevated surge session (+{s['gain']} pts over {s['game_count']} games, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day) | {date_span_str}"
             if is_recent:
-                signals_smoke.append(sig_text)
-                if len([x for x in filtered_surges if x["end_time"] >= recency_cutoff_ts]) >= 2:
-                    if "Rating Volatility / Multi-Surge Recovery" not in primary_triggers:
-                        primary_triggers.append("Rating Volatility / Multi-Surge Recovery")
+                if is_congruent_with_pool:
+                    historical_anomalies.append(f"[Suppressed Surge #{s_idx}] {s_cat} | Surge peak ({s['end_rating']}) congruent with established rating baseline ({other_live_max}) | {date_span_str}")
                 else:
-                    if "Isolated High-Velocity Surge" not in primary_triggers:
-                        primary_triggers.append("Isolated High-Velocity Surge")
+                    signals_smoke.append(sig_text)
+                    if len([x for x in filtered_surges if x["end_time"] >= recency_cutoff_ts]) >= 2:
+                        if "Rating Volatility / Multi-Surge Recovery" not in primary_triggers:
+                            primary_triggers.append("Rating Volatility / Multi-Surge Recovery")
+                    else:
+                        if "Isolated High-Velocity Surge" not in primary_triggers:
+                            primary_triggers.append("Isolated High-Velocity Surge")
             else:
                 historical_anomalies.append(f"[Historical Surge #{s_idx}] {sig_text}")
 
