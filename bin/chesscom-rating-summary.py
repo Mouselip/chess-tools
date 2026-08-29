@@ -26,16 +26,18 @@
 #   accuracy with analysis coverage counts, latest rating, last played date
 #   per category, abandoned games with material deficit telemetry, and rating
 #   spread. Detects suspicious streaks of consecutive short-ply games
-#   (0 < ply <= 13) and sustained high-accuracy winning streaks (accuracy >= 96.0%,
-#   ply >= 45, 100% wins, strictly consecutive and time-bounded within <= 48h,
-#   live categories only). Evaluates rating trajectories, dormancy gaps,
-#   rating landslides / sandbagging / tilt spirals, and high-velocity surges
-#   with density-gated accuracy corroboration.
+#   (0 < ply <= 13, live categories only) and sustained high-accuracy winning
+#   streaks (accuracy >= 96.0%, ply >= 45, 100% wins, strictly consecutive and
+#   time-bounded within <= 48h, live categories only). Evaluates rating trajectories,
+#   dormancy gaps, rating landslides / sandbagging / tilt spirals, and high-velocity
+#   surges with density-gated accuracy corroboration. Applies a 2-year recency lookback
+#   window for active verdicts (Smoke/Fire) while segregating older triggers into
+#   historical context.
 #   Synthesizes graduated verdicts (Human, Smoke, or Fire) with explicit category
 #   names, dates in evaluation details, clear trigger attribution, and pool breakdowns.
 #   Includes robust HTTP 429/transient retry backoff and an optional User-Agent CLI flag.
 #
-# Version: v1.2.0
+# Version: v1.3.0
 
 import argparse
 import datetime
@@ -46,14 +48,17 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "v1.2.0"
+VERSION = "v1.3.0"
 DEFAULT_REPO_URL = "https://github.com/Mouselip/chess-tools"
 
 # Pool and category filters
 TARGET_CATEGORIES = ("bullet", "blitz", "rapid", "daily")
 LIVE_CATEGORIES = ("bullet", "blitz", "rapid")
 
-# Short-ply streak detection constants
+# Time decay lookback window for active verdicts (2 years)
+RECENCY_LOOKBACK_SECONDS = 2 * 365 * 86400
+
+# Short-ply streak detection constants (Live pools only)
 MAX_PLY = 13
 MIN_SHORT_PLY_STREAK = 3
 
@@ -242,6 +247,7 @@ def main():
     }
 
     all_rated_games = []
+    live_rated_games = []
     category_games = {cat: [] for cat in TARGET_CATEGORIES}
 
     total_months = len(archive_urls)
@@ -351,6 +357,8 @@ def main():
             }
 
             all_rated_games.append(game_obj)
+            if time_class in LIVE_CATEGORIES:
+                live_rated_games.append(game_obj)
             if time_class in category_games:
                 category_games[time_class].append(game_obj)
 
@@ -358,6 +366,7 @@ def main():
     sys.stderr.flush()
 
     all_rated_games.sort(key=lambda g: g["end_time"])
+    live_rated_games.sort(key=lambda g: g["end_time"])
     for cat in TARGET_CATEGORIES:
         category_games[cat].sort(key=lambda g: g["end_time"])
 
@@ -442,15 +451,15 @@ def main():
 
     print("=" * 102, flush=True)
 
-    # Section 2: Chronological Short-Ply Streak Detection
+    # Section 2: Chronological Short-Ply Streak Detection (Live Categories Only)
     print(f"\n" + "=" * 102, flush=True)
-    print(f" SUSPICIOUS SHORT-PLY STREAKS (0 < Ply <= {MAX_PLY}, >= {MIN_SHORT_PLY_STREAK} Consecutive Games)", flush=True)
+    print(f" SUSPICIOUS SHORT-PLY STREAKS (0 < Ply <= {MAX_PLY}, >= {MIN_SHORT_PLY_STREAK} Consecutive Live Games)", flush=True)
     print("=" * 102, flush=True)
 
     streaks = []
     current_streak = []
 
-    for game in all_rated_games:
+    for game in live_rated_games:
         if 0 < game["ply"] <= MAX_PLY:
             current_streak.append(game)
         else:
@@ -462,7 +471,7 @@ def main():
         streaks.append(list(current_streak))
 
     if not streaks:
-        print(f"No consecutive streaks of >= {MIN_SHORT_PLY_STREAK} short-ply games detected.", flush=True)
+        print(f"No consecutive streaks of >= {MIN_SHORT_PLY_STREAK} short-ply live games detected.", flush=True)
     else:
         for idx, streak in enumerate(streaks, start=1):
             wins = sum(1 for g in streak if g["outcome"] == "WIN")
@@ -786,7 +795,8 @@ def main():
                 draws = sum(1 for g in window_games if g["outcome"] == "DRAW")
                 loss_rate = (losses / w_count) * 100.0
 
-                short_ply_count = sum(1 for g in window_games if 0 < g["ply"] <= MAX_PLY)
+                # Match short-ply games strictly using MAX_PLY (including 0-ply resignations/aborts)
+                short_ply_count = sum(1 for g in window_games if g["ply"] <= MAX_PLY)
                 short_ply_ratio = short_ply_count / w_count if w_count > 0 else 0.0
                 abandoned_deficit_count = sum(1 for g in window_games if g.get("is_deficit_abandon", False))
 
@@ -880,113 +890,153 @@ def main():
                 gap_days = (l["precursor_surge"]["start_time"] - l["end_time"]) / 86400.0
                 print(f"  Precursor   : Occurred {gap_days:.1f} days prior to Surge #{l['precursor_surge'].get('surge_index', '?')} (+{l['precursor_surge']['gain']} pts)", flush=True)
 
-    # Section 5: Forensic Synthesis & Verdict Determination
-    reasons = []
+    # Section 5: Forensic Synthesis & Verdict Determination (With Recency Decay)
+    latest_game_ts = max((g["end_time"] for g in all_rated_games), default=time.time())
+    recency_cutoff_ts = latest_game_ts - RECENCY_LOOKBACK_SECONDS
+
     signals_smoke = []
     signals_fire = []
+    historical_anomalies = []
     primary_triggers = []
 
-    # Check for Fire-level conditions
+    # Check Surges
     for s in filtered_surges:
         s_cat = s["category"].capitalize()
         s_idx = s.get("surge_index", "?")
         s_start_d = datetime.datetime.fromtimestamp(s["start_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
         s_end_d = datetime.datetime.fromtimestamp(s["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
         date_span_str = f"{s_start_d}" if s_start_d == s_end_d else f"{s_start_d} -> {s_end_d}"
+        is_recent = (s["end_time"] >= recency_cutoff_ts)
 
         if s["avg_acc"] is not None and s["acc_count"] >= 5 and s["acc_coverage"] >= 30.0 and s["avg_acc"] >= 93.0:
-            signals_fire.append(f"[Surge #{s_idx}] {s_cat} | High-velocity surge corroborated by extreme accuracy (+{s['gain']} pts, {s['win_rate']:.1f}% WR, {s['avg_acc']:.1f}% avg acc across {s['acc_count']} games) | {date_span_str}")
-            if "Engine-Corroborated Rating Surge" not in primary_triggers:
-                primary_triggers.append("Engine-Corroborated Rating Surge")
+            sig_text = f"[Surge #{s_idx}] {s_cat} | High-velocity surge corroborated by extreme accuracy (+{s['gain']} pts, {s['win_rate']:.1f}% WR, {s['avg_acc']:.1f}% avg acc across {s['acc_count']} games) | {date_span_str}"
+            if is_recent:
+                signals_fire.append(sig_text)
+                if "Engine-Corroborated Rating Surge" not in primary_triggers:
+                    primary_triggers.append("Engine-Corroborated Rating Surge")
+            else:
+                historical_anomalies.append(f"[Historical Surge #{s_idx}] {sig_text}")
         elif s["reactivation"] and s["pace_day"] >= 25.0 and s["win_rate"] >= 80.0:
-            signals_fire.append(f"[Surge #{s_idx}] {s_cat} | Reactivation surge (+{s['gain']} pts, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day post-dormancy) | {date_span_str}")
-            if "Post-Dormancy Reactivation Surge" not in primary_triggers:
-                primary_triggers.append("Post-Dormancy Reactivation Surge")
+            sig_text = f"[Surge #{s_idx}] {s_cat} | Reactivation surge (+{s['gain']} pts, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day post-dormancy) | {date_span_str}"
+            if is_recent:
+                signals_fire.append(sig_text)
+                if "Post-Dormancy Reactivation Surge" not in primary_triggers:
+                    primary_triggers.append("Post-Dormancy Reactivation Surge")
+            else:
+                historical_anomalies.append(f"[Historical Surge #{s_idx}] {sig_text}")
         elif s["gain"] >= 200 and s["days"] <= 7.0 and s["pace_day"] >= 35.0 and s["win_rate"] >= 85.0:
-            signals_fire.append(f"[Surge #{s_idx}] {s_cat} | High-velocity macro surge (+{s['gain']} pts in {s['days']:.1f}d at +{s['pace_day']:.1f} pts/day, {s['win_rate']:.1f}% win rate) | {date_span_str}")
-            if "High-Velocity Macro Surge" not in primary_triggers:
-                primary_triggers.append("High-Velocity Macro Surge")
+            sig_text = f"[Surge #{s_idx}] {s_cat} | High-velocity macro surge (+{s['gain']} pts in {s['days']:.1f}d at +{s['pace_day']:.1f} pts/day, {s['win_rate']:.1f}% win rate) | {date_span_str}"
+            if is_recent:
+                signals_fire.append(sig_text)
+                if "High-Velocity Macro Surge" not in primary_triggers:
+                    primary_triggers.append("High-Velocity Macro Surge")
+            else:
+                historical_anomalies.append(f"[Historical Surge #{s_idx}] {sig_text}")
+        elif 75.0 <= s["win_rate"] < 85.0 or s["pace_day"] >= 20.0:
+            sig_text = f"[Surge #{s_idx}] {s_cat} | Elevated surge session (+{s['gain']} pts over {s['game_count']} games, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day) | {date_span_str}"
+            if is_recent:
+                signals_smoke.append(sig_text)
+                if len([x for x in filtered_surges if x["end_time"] >= recency_cutoff_ts]) >= 2:
+                    if "Rating Volatility / Multi-Surge Recovery" not in primary_triggers:
+                        primary_triggers.append("Rating Volatility / Multi-Surge Recovery")
+                else:
+                    if "Isolated High-Velocity Surge" not in primary_triggers:
+                        primary_triggers.append("Isolated High-Velocity Surge")
+            else:
+                historical_anomalies.append(f"[Historical Surge #{s_idx}] {sig_text}")
 
-    # Landslide / Sandbagging Fire & Smoke Signals
+    # Check Landslides
     for l in filtered_landslides:
         l_cat = l["category"].capitalize()
         l_idx = l.get("landslide_index", "?")
         l_start_d = datetime.datetime.fromtimestamp(l["start_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
         l_end_d = datetime.datetime.fromtimestamp(l["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
         date_span_str = f"{l_start_d}" if l_start_d == l_end_d else f"{l_start_d} -> {l_end_d}"
+        is_recent = (l["end_time"] >= recency_cutoff_ts)
 
         if l["classifier"] == "EXPLICIT DUMP":
-            signals_fire.append(f"[Landslide #{l_idx}] {l_cat} | Explicit short-ply rating dump (-{l["drop"]} pts in {l['days']:.1f}d, {l['short_ply_count']} short-ply games) | {date_span_str}")
-            if "Explicit Short-Ply Rating Dumping" not in primary_triggers:
-                primary_triggers.append("Explicit Short-Ply Rating Dumping")
+            sig_text = f"[Landslide #{l_idx}] {l_cat} | Explicit short-ply rating dump (-{l['drop']} pts in {l['days']:.1f}d, {l['short_ply_count']} short-ply games) | {date_span_str}"
+            if is_recent:
+                signals_fire.append(sig_text)
+                if "Explicit Short-Ply Rating Dumping" not in primary_triggers:
+                    primary_triggers.append("Explicit Short-Ply Rating Dumping")
+            else:
+                historical_anomalies.append(f"[Historical Landslide #{l_idx}] {sig_text}")
         elif l["classifier"] == "REBOUND DUMP / CYCLE":
             s_idx = l["precursor_surge"].get("surge_index", "?")
-            signals_fire.append(f"[Landslide #{l_idx}] {l_cat} | Sandbagging-surge cycle (-{l['drop']} pts dump serving as baseline for Surge #{s_idx}) | {date_span_str}")
-            if "Sandbagging-Surge Cycle" not in primary_triggers:
-                primary_triggers.append("Sandbagging-Surge Cycle")
+            sig_text = f"[Landslide #{l_idx}] {l_cat} | Sandbagging-surge cycle (-{l['drop']} pts dump serving as baseline for Surge #{s_idx}) | {date_span_str}"
+            if is_recent:
+                signals_fire.append(sig_text)
+                if "Sandbagging-Surge Cycle" not in primary_triggers:
+                    primary_triggers.append("Sandbagging-Surge Cycle")
+            else:
+                historical_anomalies.append(f"[Historical Landslide #{l_idx}] {sig_text}")
         else:
-            signals_smoke.append(f"[Landslide #{l_idx}] {l_cat} | High-velocity tilt spiral / slump (-{l['drop']} pts over {l['game_count']} games, {l['loss_rate']:.1f}% loss rate) | {date_span_str}")
-            if "High-Velocity Tilt Spiral / Slump" not in primary_triggers:
-                primary_triggers.append("High-Velocity Tilt Spiral / Slump")
+            sig_text = f"[Landslide #{l_idx}] {l_cat} | High-velocity tilt spiral / slump (-{l['drop']} pts over {l['game_count']} games, {l['loss_rate']:.1f}% loss rate) | {date_span_str}"
+            if is_recent:
+                signals_smoke.append(sig_text)
+                if "High-Velocity Tilt Spiral / Slump" not in primary_triggers:
+                    primary_triggers.append("High-Velocity Tilt Spiral / Slump")
+            else:
+                historical_anomalies.append(f"[Historical Landslide #{l_idx}] {sig_text}")
 
+    # Check High-Accuracy Winning Streaks
     for idx_a, a_streak in enumerate(acc_streaks, start=1):
         avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
         a_cat = a_streak[0]["time_class"].capitalize()
         a_start_d = datetime.datetime.fromtimestamp(a_streak[0]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
         a_end_d = datetime.datetime.fromtimestamp(a_streak[-1]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
         a_date_span = f"{a_start_d}" if a_start_d == a_end_d else f"{a_start_d} -> {a_end_d}"
+        is_recent = (a_streak[-1]["end_time"] >= recency_cutoff_ts)
 
         if len(a_streak) >= 5:
-            signals_fire.append(f"[Acc Streak #{idx_a}] {a_cat} | Severe high-accuracy winning streak ({len(a_streak)} consecutive wins >= {MIN_ACC_PLY} ply, avg {avg_a:.1f}% acc) | {a_date_span}")
-            if "Severe High-Accuracy Streak" not in primary_triggers:
-                primary_triggers.append("Severe High-Accuracy Streak")
+            sig_text = f"[Acc Streak #{idx_a}] {a_cat} | Severe high-accuracy winning streak ({len(a_streak)} consecutive wins >= {MIN_ACC_PLY} ply, avg {avg_a:.1f}% acc) | {a_date_span}"
+            if is_recent:
+                signals_fire.append(sig_text)
+                if "Severe High-Accuracy Streak" not in primary_triggers:
+                    primary_triggers.append("Severe High-Accuracy Streak")
+            else:
+                historical_anomalies.append(f"[Historical Acc Streak #{idx_a}] {sig_text}")
         elif len(a_streak) >= 4 and filtered_surges:
-            signals_fire.append(f"[Acc Streak #{idx_a}] {a_cat} | High-accuracy winning streak corroborated by surge ({len(a_streak)} consecutive wins, avg {avg_a:.1f}% acc) | {a_date_span}")
-            if "Surge-Corroborated Accuracy Streak" not in primary_triggers:
-                primary_triggers.append("Surge-Corroborated Accuracy Streak")
+            sig_text = f"[Acc Streak #{idx_a}] {a_cat} | High-accuracy winning streak corroborated by surge ({len(a_streak)} consecutive wins, avg {avg_a:.1f}% acc) | {a_date_span}"
+            if is_recent:
+                signals_fire.append(sig_text)
+                if "Surge-Corroborated Accuracy Streak" not in primary_triggers:
+                    primary_triggers.append("Surge-Corroborated Accuracy Streak")
+            else:
+                historical_anomalies.append(f"[Historical Acc Streak #{idx_a}] {sig_text}")
+        elif len(a_streak) >= 4:
+            sig_text = f"[Acc Streak #{idx_a}] {a_cat} | Sustained high-accuracy winning streak ({len(a_streak)} consecutive wins >= {MIN_ACC_PLY} ply, avg {avg_a:.1f}%) | {a_date_span}"
+            if is_recent:
+                signals_smoke.append(sig_text)
+                if "Sustained High-Accuracy Session" not in primary_triggers:
+                    primary_triggers.append("Sustained High-Accuracy Session")
+            else:
+                historical_anomalies.append(f"[Historical Acc Streak #{idx_a}] {sig_text}")
+
+    # Check Live Short-Ply Streaks (Filtered by Recency)
+    recent_streaks = [st for st in streaks if st[-1]["end_time"] >= recency_cutoff_ts]
+    recent_short_games = sum(len(st) for st in recent_streaks)
+    recent_max_streak_len = max([len(st) for st in recent_streaks]) if recent_streaks else 0
 
     total_short_games = sum(len(st) for st in streaks)
     max_streak_len = max([len(st) for st in streaks]) if streaks else 0
-    if max_streak_len >= 5 or total_short_games >= 12:
-        signals_fire.append(f"Severe short-ply streaks (Max: {max_streak_len} consecutive games, Total: {total_short_games})")
+
+    if recent_max_streak_len >= 5 or recent_short_games >= 12:
+        signals_fire.append(f"Severe live short-ply streaks (Max: {recent_max_streak_len} consecutive games, Total: {recent_short_games} in past 2 years)")
         if "Severe Short-Ply Rating Dumping/Farming" not in primary_triggers:
             primary_triggers.append("Severe Short-Ply Rating Dumping/Farming")
-
-    # Check for Smoke-level conditions
-    for s in filtered_surges:
-        s_cat = s["category"].capitalize()
-        s_idx = s.get("surge_index", "?")
-        s_start_d = datetime.datetime.fromtimestamp(s["start_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
-        s_end_d = datetime.datetime.fromtimestamp(s["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
-        date_span_str = f"{s_start_d}" if s_start_d == s_end_d else f"{s_start_d} -> {s_end_d}"
-
-        if s not in signals_fire:
-            if 75.0 <= s["win_rate"] < 85.0 or s["pace_day"] >= 20.0:
-                signals_smoke.append(f"[Surge #{s_idx}] {s_cat} | Elevated surge session (+{s['gain']} pts over {s['game_count']} games, {s['win_rate']:.1f}% win rate, +{s['pace_day']:.1f} pts/day) | {date_span_str}")
-                if len(filtered_surges) >= 2:
-                    if "Rating Volatility / Multi-Surge Recovery" not in primary_triggers:
-                        primary_triggers.append("Rating Volatility / Multi-Surge Recovery")
-                else:
-                    if "Isolated High-Velocity Surge" not in primary_triggers:
-                        primary_triggers.append("Isolated High-Velocity Surge")
-
-    for idx_a, a_streak in enumerate(acc_streaks, start=1):
-        avg_a = sum(g["accuracy"] for g in a_streak) / len(a_streak)
-        a_cat = a_streak[0]["time_class"].capitalize()
-        a_start_d = datetime.datetime.fromtimestamp(a_streak[0]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
-        a_end_d = datetime.datetime.fromtimestamp(a_streak[-1]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
-        a_date_span = f"{a_start_d}" if a_start_d == a_end_d else f"{a_start_d} -> {a_end_d}"
-
-        if len(a_streak) >= 4 and not any("high-accuracy" in f for f in signals_fire):
-            signals_smoke.append(f"[Acc Streak #{idx_a}] {a_cat} | Sustained high-accuracy winning streak ({len(a_streak)} consecutive wins >= {MIN_ACC_PLY} ply, avg {avg_a:.1f}%) | {a_date_span}")
-            if "Sustained High-Accuracy Session" not in primary_triggers:
-                primary_triggers.append("Sustained High-Accuracy Session")
-
-    if len(streaks) >= 2 and not signals_fire:
-        signals_smoke.append(f"Multiple short-ply streaks detected ({len(streaks)} streaks)")
+    elif len(recent_streaks) >= 2:
+        signals_smoke.append(f"Multiple live short-ply streaks detected ({len(recent_streaks)} streaks in past 2 years)")
         if "Moderate Short-Ply Activity" not in primary_triggers:
             primary_triggers.append("Moderate Short-Ply Activity")
 
+    for st in streaks:
+        if st[-1]["end_time"] < recency_cutoff_ts:
+            st_start_d = datetime.datetime.fromtimestamp(st[0]["end_time"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+            historical_anomalies.append(f"[Historical Short-Ply Streak] {len(st)} games ({st[0]['time_class'].capitalize()}) | {st_start_d}")
+
+    # Final graduated verdict determination
     if signals_fire:
         verdict = "Fire"
         reasons = signals_fire
@@ -1004,7 +1054,7 @@ def main():
     print(f" Verdict         : {verdict}", flush=True)
     print(f" Trigger Category: {', '.join(primary_triggers)}", flush=True)
     print(f" Primary Signals :", flush=True)
-    streak_summary = f"{len(streaks)} streaks found (Max: {max_streak_len} games, Total: {total_short_games} games)" if streaks else "None detected"
+    streak_summary = f"{len(streaks)} streaks found (Max: {max_streak_len} games, Total: {total_short_games} games, Live pools only)" if streaks else "None detected"
     print(f"   - [Short-Ply Streaks]   : {streak_summary}", flush=True)
 
     if acc_streaks:
@@ -1044,9 +1094,15 @@ def main():
         surge_signal_str = "0 high-velocity surges detected"
     print(f"   - [Surge Profile]       : {surge_signal_str}", flush=True)
 
-    print(f" Evaluation Details:", flush=True)
+    print(f" Evaluation Details (Active Lookback: Past 2 Years):", flush=True)
     for r in reasons:
         print(f"   * {r}", flush=True)
+
+    if historical_anomalies:
+        print(f" Historical Anomalies (> 2 Years Old):", flush=True)
+        for h in historical_anomalies:
+            print(f"   * {h}", flush=True)
+
     print("=" * 102 + "\n", flush=True)
 
 
