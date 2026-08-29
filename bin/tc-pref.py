@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tc-pref.py - Scan a Chess.com player's archives to find preferred time controls.
+tc-pref.py - Scan a target player's Chess.com archives to find their most preferred time control.
 
 Copyright (C) 2026 Tyrin R. Price
 This program is free software: you can redistribute it and/or modify
@@ -22,8 +22,8 @@ import sys
 import urllib.error
 import urllib.request
 
-VERSION = "0.0.5"
-USER_AGENT = "tc-pref/0.0.5"
+VERSION = "1.0.0"
+USER_AGENT = "tc-pref/1.0.0"
 
 
 def parse_args():
@@ -75,7 +75,12 @@ def parse_args():
         parser.print_help(sys.stderr)
         sys.exit(1)
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.months <= 0:
+        parser.error("-m/--months must be greater than 0")
+
+    return args
 
 
 def fetch_json(url):
