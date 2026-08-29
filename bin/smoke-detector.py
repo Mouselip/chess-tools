@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v2.1.1)
+# smoke-detector.py (v2.1.2)
 # Chess.com fair play and rating manipulation screener: analyzes move
 # cadence, sharp-position engine alignment, and intentional losses to flag
 # suspicious indicators ("smoke") without providing definitive proof of
@@ -22,7 +22,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -46,7 +46,7 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/2.1.1 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/2.1.2 (terminal-tool; python-chess)"
 DEFAULT_ENGINE_TIMEOUT = 8.0
 
 # -----------------------------------------------------------------------------
@@ -482,6 +482,7 @@ def analyze_single_game_engine(
     opp = black if is_white else white
     date = headers.get("Date", "????.??.??")
     result_header = headers.get("Result", "*")
+    link = headers.get("Link", "")
 
     mg_start, mg_end = get_phase_boundaries(game, reader)
     if reader is not None:
@@ -637,6 +638,7 @@ def analyze_single_game_engine(
                 "game_idx": game_idx,
                 "date": date,
                 "opp": opp,
+                "link": link,
                 "blunder_move": final_d["move_num"],
                 "blunder_san": final_d["san"],
                 "eval_desc": eval_desc,
@@ -854,6 +856,8 @@ def print_detected_anomalies(anomalies: list[dict]):
     print("!" * 80)
     for a in anomalies:
         print(f"  * Game #{a['game_idx']} ({a['date']} vs {a['opp']}):")
+        if a.get("link"):
+            print(f"     {a['link']}")
         print(f"      - Position Viability: Prior move held stable eval ({a['prior_eval']})")
         print(f"      - Terminal Collapse:  Move {a['blunder_move']}. {a['blunder_san']} ({a['eval_desc']})")
         print(f"      - Non-Panic Clock:    {a['clock_left']} in reserve (Spent {a['think_time']:.1f}s calculating blunder)")
