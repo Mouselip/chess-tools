@@ -22,8 +22,8 @@ import sys
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.0"
-USER_AGENT = "tc-pref/1.0.0"
+VERSION = "1.0.1"
+USER_AGENT = "tc-pref/1.0.1"
 
 
 def parse_args():
@@ -43,8 +43,8 @@ def parse_args():
         "-m",
         "--months",
         type=int,
-        default=3,
-        help="Number of archive months to check (default: 3)",
+        default=None,
+        help="Number of most recent archive months to check (default: all)",
     )
     parser.add_argument(
         "--since",
@@ -77,7 +77,7 @@ def parse_args():
 
     args = parser.parse_args()
 
-    if args.months <= 0:
+    if args.months is not None and args.months <= 0:
         parser.error("-m/--months must be greater than 0")
 
     return args
@@ -125,7 +125,7 @@ def filter_archives(archive_urls, since, until, months):
     if until:
         extracted = [item for item in extracted if item[0] <= until]
 
-    if not since and not until:
+    if not since and not until and months is not None:
         extracted = extracted[-months:]
 
     return [url for _, url in extracted]
