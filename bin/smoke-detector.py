@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v2.1.0)
+# smoke-detector.py (v2.1.1)
 # Chess.com fair play and rating manipulation screener: analyzes move
 # cadence, sharp-position engine alignment, and intentional losses to flag
 # suspicious indicators ("smoke") without providing definitive proof of
@@ -22,7 +22,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -36,6 +36,7 @@ import argparse
 import urllib.request
 import urllib.error
 import json
+from datetime import datetime
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
@@ -45,7 +46,7 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/2.1.0 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/2.1.1 (terminal-tool; python-chess)"
 DEFAULT_ENGINE_TIMEOUT = 8.0
 
 # -----------------------------------------------------------------------------
@@ -77,7 +78,7 @@ def classify_time_control(tc_str: str) -> str:
     elif effective_seconds < 480.0:
         return "blitz"
     else:
-        return "rapid_classical"
+        return "rapid"
 
 def fetch_json(url: str) -> dict | list | None:
     req = urllib.request.Request(
@@ -871,19 +872,22 @@ def run_forensic_analysis(
     allow_unrated: bool = False,
     export_pgn_path: str | None = None
 ):
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"smoke-detector.py v{__version__} ({now_str})")
+
     tc_category = classify_time_control(target_tc)
 
     if tc_category == "bullet":
-        print("[*] Bullet time detected! Entering the Matrix...")
+        print("[*] Bullet time control detected.")
         print("[*] Bypassing engine evaluation: analyzing clock signatures and interval cadence only.")
     elif tc_category == "blitz":
-        print("[*] Blitz stream detected.")
+        print("[*] Blitz time control detected.")
         print("[*] Evaluating complete middlegame decisions across all clock states.")
-    elif tc_category == "rapid_classical":
-        print("[*] Rapid/Classical stream detected.")
+    elif tc_category == "rapid":
+        print("[*] Rapid time control detected.")
         print("[*] Launching full behavioral matrix profiling.")
     elif tc_category == "daily":
-        print("[*] Daily/Correspondence stream detected.")
+        print("[*] Daily/Correspondence time control detected.")
         print("[*] Bypassing clock timestamps: running pure engine fidelity and Tier-4 precision profiling.")
 
     if tc_category != "bullet":
