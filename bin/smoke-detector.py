@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v2.0.2)
+# smoke-detector.py (v2.1.0)
 # Chess.com fair play and rating manipulation screener: analyzes move
 # cadence, sharp-position engine alignment, and intentional losses to flag
 # suspicious indicators ("smoke") without providing definitive proof of
@@ -22,7 +22,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2.0.2"
+__version__ = "2.1.0"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -45,7 +45,7 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/2.0.2 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/2.1.0 (terminal-tool; python-chess)"
 DEFAULT_ENGINE_TIMEOUT = 8.0
 
 # -----------------------------------------------------------------------------
@@ -496,6 +496,7 @@ def analyze_single_game_engine(
     min_depth_reached = depth
     engine_times = []
     decisions_eval_history = []
+    consecutive_blowout_plies = 0
 
     while node.variations:
         next_node = node.variation(0)
@@ -511,6 +512,11 @@ def analyze_single_game_engine(
             prev_clocks[turn] = curr_clock
 
         if mg_start <= ply <= mg_end and turn == target_color:
+            if consecutive_blowout_plies >= 2:
+                board.push(move)
+                node = next_node
+                continue
+
             engine, eval_res = evaluate_position(
                 engine, board, depth=depth, timeout=engine_timeout,
                 engine_path=engine_path, hash_mb=hash_mb_per_worker
@@ -570,6 +576,22 @@ def analyze_single_game_engine(
                 "time_spent": time_spent,
                 "curr_clock": curr_clock
             })
+
+            if abs(after_white_score) >= 600:
+                consecutive_blowout_plies += 1
+            else:
+                consecutive_blowout_plies = 0
+        else:
+            if 0 < consecutive_blowout_plies < 2:
+                engine, eval_res = evaluate_position(
+                    engine, board, depth=depth, timeout=engine_timeout,
+                    engine_path=engine_path, hash_mb=hash_mb_per_worker
+                )
+                opp_best_white = eval_res["scores"][0]
+                if abs(opp_best_white) >= 600:
+                    consecutive_blowout_plies += 1
+                else:
+                    consecutive_blowout_plies = 0
 
         board.push(move)
         node = next_node
