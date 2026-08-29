@@ -22,8 +22,8 @@ import sys
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.1"
-USER_AGENT = "tc-pref/1.0.1"
+VERSION = "1.0.2"
+USER_AGENT = "tc-pref/1.0.2"
 
 
 def parse_args():
@@ -183,8 +183,15 @@ def main():
     total_matched_games = 0
     rated_target = not args.unrated
     game_mode_label = "Unrated" if args.unrated else "Rated"
+    total_archives = len(target_archives)
 
-    for url in target_archives:
+    ym_pattern = re.compile(r"/(\d{4})/(\d{2})$")
+
+    for idx, url in enumerate(target_archives, start=1):
+        match = ym_pattern.search(url)
+        ym_label = f"{match.group(1)}-{match.group(2)}" if match else url
+        sys.stderr.write(f"[{idx}/{total_archives}] Fetching {ym_label}...\n")
+
         month_data = fetch_json(url)
         if not month_data:
             continue
@@ -199,12 +206,12 @@ def main():
                 total_matched_games += 1
 
     if not tc_counts:
-        print(f"No {game_mode_label.lower()} games found in the selected archives.")
+        print(f"\nNo {game_mode_label.lower()} games found in the selected archives.")
         sys.exit(0)
 
-    print(f"Player: {username}")
+    print(f"\nPlayer: {username}")
     print(f"Mode: {game_mode_label} Games")
-    print(f"Scanned Archives: {len(target_archives)} month(s)")
+    print(f"Scanned Archives: {total_archives} month(s)")
     print(f"Total Games Analyzed: {total_matched_games}\n")
 
     for tc, count in tc_counts.most_common():
