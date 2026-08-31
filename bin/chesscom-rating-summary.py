@@ -37,7 +37,7 @@
 #   names, dates in evaluation details, clear trigger attribution, and pool breakdowns.
 #   Includes robust HTTP 429/transient retry backoff and an optional User-Agent CLI flag.
 #
-# Version: v1.2.2
+# Version: v1.3.0
 
 import argparse
 import datetime
@@ -48,7 +48,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "v1.2.2"
+VERSION = "v1.3.0"
 DEFAULT_REPO_URL = "https://github.com/Mouselip/chess-tools"
 
 # Pool and category filters
@@ -648,6 +648,8 @@ def main():
     print(f"\n{surge_criteria_str}" + "-" * max(0, 102 - len(surge_criteria_str)), flush=True)
 
     surges = []
+    max_surge_seconds = SURGE_MAX_DAYS * 86400.0
+
     for cat in TARGET_CATEGORIES:
         games = category_games[cat]
         n_games = len(games)
@@ -655,68 +657,96 @@ def main():
             continue
 
         start_bound = max(0, SURGE_IGNORE_ONBOARDING)
-        for i in range(start_bound, n_games):
+        cat_dormancy = [d for d in dormancy_events if d["category"] == cat]
+
+        for i in range(start_bound, n_games - SURGE_MIN_GAMES + 1):
             start_g = games[i]
+            start_ts = start_g["end_time"]
+
+            wins = 0
+            losses = 0
+            draws = 0
+            analyzed_in_window = []
+
+            # Pre-accumulate up to SURGE_MIN_GAMES - 1
+            for k in range(i, i + SURGE_MIN_GAMES - 1):
+                g_k = games[k]
+                out = g_k["outcome"]
+                if out == "WIN":
+                    wins += 1
+                elif out == "LOSS":
+                    losses += 1
+                elif out == "DRAW":
+                    draws += 1
+                if g_k["accuracy"] is not None:
+                    analyzed_in_window.append(g_k["accuracy"])
+
             for j in range(i + SURGE_MIN_GAMES - 1, n_games):
                 end_g = games[j]
-                time_diff = end_g["end_time"] - start_g["end_time"]
-                actual_days = max(time_diff / 86400.0, 0.001)
-
-                if actual_days > SURGE_MAX_DAYS:
+                time_diff = end_g["end_time"] - start_ts
+                if time_diff > max_surge_seconds:
                     break
 
+                out = end_g["outcome"]
+                if out == "WIN":
+                    wins += 1
+                elif out == "LOSS":
+                    losses += 1
+                elif out == "DRAW":
+                    draws += 1
+                if end_g["accuracy"] is not None:
+                    analyzed_in_window.append(end_g["accuracy"])
+
                 gain = end_g["player_rating"] - start_g["player_rating"]
-                if gain >= SURGE_MIN_PTS:
-                    effective_days = max(actual_days, 1.0)
-                    velocity = gain / effective_days
+                if gain < SURGE_MIN_PTS:
+                    continue
 
-                    if velocity >= SURGE_MIN_VELOCITY:
-                        window_games = games[i:j + 1]
-                        wins = sum(1 for g in window_games if g["outcome"] == "WIN")
-                        losses = sum(1 for g in window_games if g["outcome"] == "LOSS")
-                        draws = sum(1 for g in window_games if g["outcome"] == "DRAW")
-                        win_rate = (wins / len(window_games)) * 100.0
+                actual_days = max(time_diff / 86400.0, 0.001)
+                effective_days = max(actual_days, 1.0)
+                velocity = gain / effective_days
+                if velocity < SURGE_MIN_VELOCITY:
+                    continue
 
-                        if win_rate < SURGE_MIN_WIN_RATE:
-                            continue
+                w_count = j - i + 1
+                win_rate = (wins / w_count) * 100.0
+                if win_rate < SURGE_MIN_WIN_RATE:
+                    continue
 
-                        pace_game = gain / (len(window_games) - 1)
+                window_games = games[i:j + 1]
+                pace_game = gain / (w_count - 1)
+                acc_window_count = len(analyzed_in_window)
+                acc_coverage_pct = (acc_window_count / w_count) * 100.0
+                avg_window_acc = sum(analyzed_in_window) / acc_window_count if acc_window_count > 0 else None
 
-                        analyzed_in_window = [g["accuracy"] for g in window_games if g["accuracy"] is not None]
-                        acc_window_count = len(analyzed_in_window)
-                        acc_coverage_pct = (acc_window_count / len(window_games)) * 100.0 if window_games else 0.0
-                        avg_window_acc = sum(analyzed_in_window) / acc_window_count if acc_window_count > 0 else None
+                reactivation_info = None
+                for d in cat_dormancy:
+                    if 0 <= (i - d["post_game_index"]) <= 2:
+                        reactivation_info = d
+                        break
 
-                        reactivation_info = None
-                        for d in dormancy_events:
-                            if d["category"] == cat:
-                                if 0 <= (i - d["post_game_index"]) <= 2:
-                                    reactivation_info = d
-                                    break
-
-                        surges.append({
-                            "category": cat,
-                            "gain": gain,
-                            "start_rating": start_g["player_rating"],
-                            "end_rating": end_g["player_rating"],
-                            "game_count": len(window_games),
-                            "start_time": start_g["end_time"],
-                            "end_time": end_g["end_time"],
-                            "days": actual_days,
-                            "wins": wins,
-                            "losses": losses,
-                            "draws": draws,
-                            "win_rate": win_rate,
-                            "pace_game": pace_game,
-                            "pace_day": velocity,
-                            "start_game": start_g,
-                            "end_game": end_g,
-                            "window_games": window_games,
-                            "reactivation": reactivation_info,
-                            "acc_count": acc_window_count,
-                            "acc_coverage": acc_coverage_pct,
-                            "avg_acc": avg_window_acc,
-                        })
+                surges.append({
+                    "category": cat,
+                    "gain": gain,
+                    "start_rating": start_g["player_rating"],
+                    "end_rating": end_g["player_rating"],
+                    "game_count": w_count,
+                    "start_time": start_ts,
+                    "end_time": end_g["end_time"],
+                    "days": actual_days,
+                    "wins": wins,
+                    "losses": losses,
+                    "draws": draws,
+                    "win_rate": win_rate,
+                    "pace_game": pace_game,
+                    "pace_day": velocity,
+                    "start_game": start_g,
+                    "end_game": end_g,
+                    "window_games": window_games,
+                    "reactivation": reactivation_info,
+                    "acc_count": acc_window_count,
+                    "acc_coverage": acc_coverage_pct,
+                    "avg_acc": avg_window_acc,
+                })
 
     surges.sort(key=lambda s: s["start_time"])
     filtered_surges = []
@@ -773,54 +803,85 @@ def main():
         min_g = cfg["min_games"]
         max_d = cfg["max_days"]
         min_lr = cfg["min_loss_rate"]
+        max_landslide_seconds = max_d * 86400.0
 
         start_bound = max(0, SURGE_IGNORE_ONBOARDING)
-        for i in range(start_bound, n_games):
-            start_g = games[i]
-            for j in range(i + min(FAST_DUMP_MIN_GAMES, min_g) - 1, n_games):
-                end_g = games[j]
-                time_diff = end_g["end_time"] - start_g["end_time"]
-                actual_days = max(time_diff / 86400.0, 0.001)
+        min_window_span = min(FAST_DUMP_MIN_GAMES, min_g)
 
-                if actual_days > max_d:
+        for i in range(start_bound, n_games - min_window_span + 1):
+            start_g = games[i]
+            start_ts = start_g["end_time"]
+
+            wins = 0
+            losses = 0
+            draws = 0
+            short_ply_count = 0
+            sum_ply = 0
+            abandoned_deficit_count = 0
+
+            # Pre-accumulate up to min_window_span - 1
+            for k in range(i, i + min_window_span - 1):
+                g_k = games[k]
+                out = g_k["outcome"]
+                if out == "WIN":
+                    wins += 1
+                elif out == "LOSS":
+                    losses += 1
+                elif out == "DRAW":
+                    draws += 1
+                p_k = g_k["ply"]
+                if p_k <= MAX_PLY:
+                    short_ply_count += 1
+                sum_ply += p_k
+                if g_k.get("is_deficit_abandon", False):
+                    abandoned_deficit_count += 1
+
+            for j in range(i + min_window_span - 1, n_games):
+                end_g = games[j]
+                time_diff = end_g["end_time"] - start_ts
+                if time_diff > max_landslide_seconds:
                     break
+
+                out = end_g["outcome"]
+                if out == "WIN":
+                    wins += 1
+                elif out == "LOSS":
+                    losses += 1
+                elif out == "DRAW":
+                    draws += 1
+                p_j = end_g["ply"]
+                if p_j <= MAX_PLY:
+                    short_ply_count += 1
+                sum_ply += p_j
+                if end_g.get("is_deficit_abandon", False):
+                    abandoned_deficit_count += 1
 
                 drop = start_g["player_rating"] - end_g["player_rating"]
                 if drop <= 0:
                     continue
 
-                window_games = games[i:j + 1]
-                w_count = len(window_games)
-                wins = sum(1 for g in window_games if g["outcome"] == "WIN")
-                losses = sum(1 for g in window_games if g["outcome"] == "LOSS")
-                draws = sum(1 for g in window_games if g["outcome"] == "DRAW")
+                w_count = j - i + 1
                 loss_rate = (losses / w_count) * 100.0
+                short_ply_ratio = short_ply_count / w_count
 
-                # Match short-ply games strictly using MAX_PLY (including 0-ply resignations/aborts)
-                short_ply_count = sum(1 for g in window_games if g["ply"] <= MAX_PLY)
-                short_ply_ratio = short_ply_count / w_count if w_count > 0 else 0.0
-                abandoned_deficit_count = sum(1 for g in window_games if g.get("is_deficit_abandon", False))
-
-                # Check Macro Landslide vs Fast Short-Ply Dump
                 is_macro = (drop >= min_p and w_count >= min_g and loss_rate >= min_lr)
                 is_fast_dump = (drop >= FAST_DUMP_MIN_PTS and w_count >= FAST_DUMP_MIN_GAMES and short_ply_ratio >= FAST_DUMP_SHORT_PLY_RATIO and loss_rate >= FAST_DUMP_MIN_LOSS_RATE)
 
                 if not (is_macro or is_fast_dump):
                     continue
 
+                actual_days = max(time_diff / 86400.0, 0.001)
                 effective_days = max(actual_days, 1.0)
                 velocity = drop / effective_days
-                pace_game = drop / (w_count - 1) if w_count > 1 else drop
-                avg_ply = sum(g["ply"] for g in window_games) / w_count if w_count > 0 else 0.0
+                pace_game = drop / (w_count - 1)
+                avg_ply = sum_ply / w_count
 
-                # Precursor check: Did this landslide bottom out directly before a surge?
                 precursor_surge = None
                 for s in filtered_surges:
                     if s["category"] == cat and 0 <= (s["start_time"] - end_g["end_time"]) <= (14 * 86400):
                         precursor_surge = s
                         break
 
-                # Classification label
                 if is_fast_dump or short_ply_ratio >= 0.40 or avg_ply < 15.0:
                     classifier = "EXPLICIT DUMP"
                     classifier_desc = "EXPLICIT RATING DUMP -> High concentration of rapid short-ply resignations/aborts."
@@ -831,13 +892,15 @@ def main():
                     classifier = "TILT SPIRAL"
                     classifier_desc = "ORGANIC TILT / SLUMP -> Full-length games with normal move counts."
 
+                window_games = games[i:j + 1]
+
                 landslides.append({
                     "category": cat,
                     "drop": drop,
                     "start_rating": start_g["player_rating"],
                     "end_rating": end_g["player_rating"],
                     "game_count": w_count,
-                    "start_time": start_g["end_time"],
+                    "start_time": start_ts,
                     "end_time": end_g["end_time"],
                     "days": actual_days,
                     "wins": wins,
@@ -895,7 +958,6 @@ def main():
     latest_game_ts = max((g["end_time"] for g in all_rated_games), default=time.time())
     recency_cutoff_ts = latest_game_ts - RECENCY_LOOKBACK_SECONDS
 
-    # Calculate highest active rating across other live categories for pool congruence check
     live_ratings = {cat: stats[cat]["latest_rating"] for cat in LIVE_CATEGORIES if stats[cat]["latest_rating"] is not None}
 
     signals_smoke = []
@@ -912,7 +974,6 @@ def main():
         date_span_str = f"{s_start_d}" if s_start_d == s_end_d else f"{s_start_d} -> {s_end_d}"
         is_recent = (s["end_time"] >= recency_cutoff_ts)
 
-        # Cross-pool rating ceiling check
         other_live_max = max([r for c, r in live_ratings.items() if c != s["category"]], default=0)
         is_congruent_with_pool = (s["end_rating"] <= (other_live_max + CONGRUENCE_TOLERANCE_PTS)) if other_live_max > 0 else False
 
