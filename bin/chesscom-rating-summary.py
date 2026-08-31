@@ -37,7 +37,7 @@
 #   names, dates in evaluation details, clear trigger attribution, and pool breakdowns.
 #   Includes robust HTTP 429/transient retry backoff and an optional User-Agent CLI flag.
 #
-# Version: v1.3.0
+# Version: v2.0.0
 
 import argparse
 import datetime
@@ -48,7 +48,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "v1.3.0"
+VERSION = "v2.0.0"
 DEFAULT_REPO_URL = "https://github.com/Mouselip/chess-tools"
 
 # Pool and category filters
@@ -267,6 +267,10 @@ def main():
             continue
 
         for game in month_data.get("games", []):
+            rules = game.get("rules", "")
+            if rules != "chess":
+                continue
+
             if not game.get("rated", False):
                 continue
 
