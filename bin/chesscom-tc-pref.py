@@ -26,7 +26,6 @@ import urllib.request
 VERSION = "1.1.0"
 USER_AGENT = "chesscom-tc-pref/1.1.0"
 
-# Enforce IPv4-only resolution for all outbound socket connections
 _orig_getaddrinfo = socket.getaddrinfo
 
 
@@ -220,10 +219,15 @@ def main():
         print(f"\nNo {game_mode_label.lower()} games found in the selected archives.")
         sys.exit(0)
 
+    top_tc, top_count = tc_counts.most_common(1)[0]
+    top_pct = (top_count / total_matched_games) * 100
+    top_formatted = format_tc(top_tc)
+
     print(f"\nPlayer: {username}")
     print(f"Mode: {game_mode_label} Games")
     print(f"Scanned Archives: {total_archives} month(s)")
-    print(f"Total Games Analyzed: {total_matched_games}\n")
+    print(f"Total Games Analyzed: {total_matched_games}")
+    print(f"Most Preferred Time Control: {top_tc} ({top_formatted}) - {top_count} games ({top_pct:.1f}%)\n")
 
     for tc, count in tc_counts.most_common():
         pct = (count / total_matched_games) * 100
