@@ -37,18 +37,22 @@
 #   names, dates in evaluation details, clear trigger attribution, and pool breakdowns.
 #   Includes robust HTTP 429/transient retry backoff and an optional User-Agent CLI flag.
 #
-# Version: v2.0.0
+# Version: v2.1.0
 
 import argparse
 import datetime
+import gzip
+import http.client
 import json
 import re
+import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 
-VERSION = "v2.0.0"
+VERSION = "v2.1.0"
 DEFAULT_REPO_URL = "https://github.com/Mouselip/chess-tools"
 
 # Pool and category filters
@@ -105,14 +109,79 @@ PIECE_VALUES = {
 }
 
 
-def fetch_json(url, user_agent, max_retries=3):
-    headers = {"User-Agent": user_agent}
+class _FastIPv4HTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        # Force IPv4 (AF_INET) and cap TCP handshake at 5s so dead IPs fail fast
+        orig_getaddrinfo = socket.getaddrinfo
+        try:
+            socket.getaddrinfo = lambda host, port, family=0, type=0, proto=0, flags=0: orig_getaddrinfo(
+                host, port, socket.AF_INET, type, proto, flags
+            )
+            self.sock = socket.create_connection((self.host, self.port), timeout=5.0)
+            if self._tunnel_host:
+                self._tunnel()
+            self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+            self.sock.settimeout(self.timeout)
+        finally:
+            socket.getaddrinfo = orig_getaddrinfo
+
+
+class _FastIPv4HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_FastIPv4HTTPSConnection, req)
+
+
+_OPENER = urllib.request.build_opener(_FastIPv4HTTPSHandler())
+
+
+def update_status(msg):
+    sys.stderr.write(f"\r{msg:<88}")
+    sys.stderr.flush()
+
+def fetch_json(url, user_agent, max_retries=3, status_prefix=None, timeout=30):
+    headers = {
+        "User-Agent": user_agent,
+        "Accept-Encoding": "gzip",
+    }
     req = urllib.request.Request(url, headers=headers)
     for attempt in range(1, max_retries + 1):
+        stop_ticker = threading.Event()
+        ticker_thread = None
+        if status_prefix:
+            start_wait = time.monotonic()
+
+            def _tick():
+                while not stop_ticker.wait(0.5):
+                    elapsed = time.monotonic() - start_wait
+                    update_status(f"{status_prefix} Waiting on server... ({elapsed:.1f}s)")
+
+            ticker_thread = threading.Thread(target=_tick, daemon=True)
+            ticker_thread.start()
+
         try:
-            with urllib.request.urlopen(req) as resp:
+            with _OPENER.open(req, timeout=timeout) as resp:
+                stop_ticker.set()
+                if ticker_thread:
+                    ticker_thread.join()
                 if resp.status == 200:
-                    return json.loads(resp.read().decode("utf-8"))
+                    chunks = []
+                    bytes_read = 0
+                    while True:
+                        chunk = resp.read(16384)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        bytes_read += len(chunk)
+                        if status_prefix:
+                            mb_read = bytes_read / (1024 * 1024)
+                            update_status(f"{status_prefix} Downloading... {mb_read:.2f} MB")
+                    raw_bytes = b"".join(chunks)
+                    if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                        raw_bytes = gzip.decompress(raw_bytes)
+                    if status_prefix:
+                        mb_total = len(raw_bytes) / (1024 * 1024)
+                        update_status(f"{status_prefix} Parsing JSON ({mb_total:.2f} MB)...")
+                    return json.loads(raw_bytes.decode("utf-8"))
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 sys.stderr.write(f"\n[-] Error: Resource not found at {url}\n")
@@ -127,21 +196,27 @@ def fetch_json(url, user_agent, max_retries=3):
                 sys.stderr.write(f"\n[-] HTTP Error {e.code}: {e.reason}\n")
                 sys.stderr.flush()
                 return None
-        except urllib.error.URLError as e:
+        except (urllib.error.URLError, TimeoutError) as e:
+            reason = getattr(e, "reason", str(e))
             sleep_seconds = attempt * 2
-            sys.stderr.write(f"\n[!] Network error: {e.reason}. Retrying in {sleep_seconds}s ({attempt}/{max_retries})...\n")
+            sys.stderr.write(f"\n[!] Network/timeout error: {reason}. Retrying in {sleep_seconds}s ({attempt}/{max_retries})...\n")
             sys.stderr.flush()
             time.sleep(sleep_seconds)
         except Exception as e:
             sys.stderr.write(f"\n[-] Unexpected error: {e}\n")
             sys.stderr.flush()
             return None
+        finally:
+            stop_ticker.set()
+            if ticker_thread and ticker_thread.is_alive():
+                ticker_thread.join()
     sys.stderr.write(f"[-] Max retries exceeded for {url}\n")
     sys.stderr.flush()
     return None
 
 
 def count_ply_from_pgn(pgn_str):
+
     if not pgn_str:
         return 0
     clean_pgn = re.sub(r"\[.*?\]", "", pgn_str)
@@ -258,15 +333,22 @@ def main():
     for idx, month_url in enumerate(archive_urls, start=1):
         parts = month_url.strip("/").split("/")
         year_month = f"{parts[-2]}-{parts[-1]}" if len(parts) >= 2 else f"month {idx}"
+        prefix = f"[*] Archive [{idx}/{total_months}] ({year_month}):"
 
-        sys.stderr.write(f"\r[*] Fetching archive [{idx}/{total_months}]: {year_month}...")
-        sys.stderr.flush()
+        update_status(f"{prefix} Connecting...")
 
-        month_data = fetch_json(month_url, user_agent=user_agent)
+        month_data = fetch_json(month_url, user_agent=user_agent, status_prefix=prefix)
         if not month_data:
             continue
 
-        for game in month_data.get("games", []):
+        games_in_month = month_data.get("games", [])
+        total_in_month = len(games_in_month)
+
+        for g_idx, game in enumerate(games_in_month, start=1):
+            if g_idx == 1 or g_idx % 50 == 0 or g_idx == total_in_month:
+                update_status(
+                    f"{prefix} Processing games [{g_idx}/{total_in_month}] (Rated total: {len(all_rated_games)})..."
+                )
             rules = game.get("rules", "")
             if rules != "chess":
                 continue
@@ -367,8 +449,7 @@ def main():
             if time_class in category_games:
                 category_games[time_class].append(game_obj)
 
-    sys.stderr.write(f"\r[*] Completed scanning {total_months} monthly archives.               \n\n")
-    sys.stderr.flush()
+    update_status(f"[*] Completed scanning {total_months} monthly archives ({len(all_rated_games)} rated games).\n\n")
 
     all_rated_games.sort(key=lambda g: g["end_time"])
     live_rated_games.sort(key=lambda g: g["end_time"])
