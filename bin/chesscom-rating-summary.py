@@ -37,7 +37,7 @@
 #   names, dates in evaluation details, clear trigger attribution, and pool breakdowns.
 #   Includes robust HTTP 429/transient retry backoff and an optional User-Agent CLI flag.
 #
-# Version: v2.1.1
+# Version: v2.1.2
 
 import argparse
 import datetime
@@ -52,7 +52,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "v2.1.1"
+VERSION = "v2.1.2"
 DEFAULT_REPO_URL = "https://github.com/Mouselip/chess-tools"
 
 # Pool and category filters
@@ -1145,13 +1145,13 @@ def main():
             primary_triggers.append("Moderate Short-Ply Activity")
     # Final graduated verdict determination
     if signals_fire:
-        verdict = "Fire"
+        verdict = "Likely Assisted"
         reasons = signals_fire
     elif signals_smoke:
-        verdict = "Smoke"
+        verdict = "Possibly Assisted"
         reasons = signals_smoke
     else:
-        verdict = "Human"
+        verdict = "Likely Unassisted"
         primary_triggers = ["None (Clean Organic Baseline)"]
         reasons = ["Rating progression, accuracy distribution, and volume profiles align with standard organic play."]
 
