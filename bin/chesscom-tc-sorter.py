@@ -16,18 +16,29 @@
 
 """
 chesscom-tc-sorter.py - Organize Chess.com PGN archives by time control
-Version: 0.0.1
+Version: 1.0.0
 """
 
 import os
 import re
 import sys
+import socket
 import argparse
 import urllib.request
 import urllib.error
 import chess.pgn
 
-__version__ = "0.0.1"
+__version__ = "1.0.0"
+
+# Force IPv4-only name resolution across all network requests
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 
 def validate_username(username: str) -> bool:
@@ -141,6 +152,8 @@ def main():
     )
 
     args = parser.parse_args()
+
+    print(f"chesscom-tc-sorter.py v{__version__}")
 
     # Check for missing username
     if not args.username:
