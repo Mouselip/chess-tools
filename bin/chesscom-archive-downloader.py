@@ -38,9 +38,14 @@ Notes:
 import sys
 import os
 import datetime
+import socket
 import requests
+import urllib3.util.connection as urllib3_cn
 
-__version__ = "0.0.1"
+# Force IPv4 only
+urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
+
+__version__ = "1.0.0"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
@@ -117,6 +122,8 @@ def main():
         print_usage_and_exit(
             code=0 if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help") else 1
         )
+
+    print(f"chesscom-archive-downloader v{__version__}")
 
     username = sys.argv[1].strip().lower()
 
