@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# smoke-detector.py (v2.1.2)
+# smoke-detector.py (v2.2.0)
 # Chess.com fair play and rating manipulation screener: analyzes move
 # cadence, sharp-position engine alignment, and intentional losses to flag
 # suspicious indicators ("smoke") without providing definitive proof of
@@ -22,7 +22,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2.1.2"
+__version__ = "2.2.0"
 __author__ = "Tyrin R. Price"
 __license__ = "GPL-3.0-or-later"
 
@@ -33,9 +33,11 @@ import re
 import time
 import shutil
 import argparse
+import socket
 import urllib.request
 import urllib.error
 import json
+import gzip
 from datetime import datetime
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -46,8 +48,10 @@ import chess.polyglot
 import chess.engine
 from scipy.stats import spearmanr
 
-USER_AGENT = "ChessCom-Forensic-Analyzer/2.1.2 (terminal-tool; python-chess)"
+USER_AGENT = "ChessCom-Forensic-Analyzer/2.2.0 (terminal-tool; python-chess)"
 DEFAULT_ENGINE_TIMEOUT = 8.0
+DEFAULT_HTTP_TIMEOUT = 15.0
+VALID_TC_CATEGORIES = {"bullet", "blitz", "rapid", "daily"}
 
 # -----------------------------------------------------------------------------
 # Module 1: Time Control Categorization & HTTP Helpers
@@ -64,9 +68,12 @@ def parse_time_control(tc_header: str) -> tuple[float, float]:
 def classify_time_control(tc_str: str) -> str:
     if not tc_str or tc_str == "?":
         return "unknown"
-    if tc_str.startswith("1/") or "/" in tc_str:
+    lower_tc = tc_str.strip().lower()
+    if lower_tc in VALID_TC_CATEGORIES:
+        return lower_tc
+    if lower_tc.startswith("1/") or "/" in lower_tc:
         return "daily"
-    parts = tc_str.split("+")
+    parts = lower_tc.split("+")
     try:
         base = float(parts[0])
         inc = float(parts[1]) if len(parts) > 1 else 0.0
@@ -80,14 +87,36 @@ def classify_time_control(tc_str: str) -> str:
     else:
         return "rapid"
 
+def is_valid_tc_arg(tc_arg: str) -> bool:
+    if not tc_arg:
+        return False
+    lower_tc = tc_arg.strip().lower()
+    if lower_tc in VALID_TC_CATEGORIES:
+        return True
+    return bool(re.match(r"^(\d+(\+\d+)?|1/\d+)$", lower_tc))
+
+_orig_getaddrinfo = socket.getaddrinfo
+
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+socket.getaddrinfo = _ipv4_only_getaddrinfo
+
 def fetch_json(url: str) -> dict | list | None:
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip"
+        }
     )
     try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=DEFAULT_HTTP_TIMEOUT) as resp:
+            raw = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip" or raw[:2] == b"\x1f\x8b":
+                raw = gzip.decompress(raw)
+            return json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
@@ -212,7 +241,9 @@ def verify_and_fetch_games(
 
     archive_urls = archives_data["archives"]
     archive_urls.reverse()
-    print(f"[+] Found {len(archive_urls)} monthly archives. Scanning backwards for TC '{target_tc}'...")
+    is_category_mode = target_tc.lower() in VALID_TC_CATEGORIES
+    mode_label = f"category '{tc_category}'" if is_category_mode else f"exact TC '{target_tc}'"
+    print(f"[+] Found {len(archive_urls)} monthly archives. Scanning backwards for {mode_label}...")
 
     selected_game_pgns = []
     accumulated_decisions = 0
@@ -230,8 +261,12 @@ def verify_and_fetch_games(
                 continue
 
             tc = game_obj.get("time_control", "")
-            if tc != target_tc:
-                continue
+            if is_category_mode:
+                if classify_time_control(tc) != tc_category:
+                    continue
+            else:
+                if tc != target_tc:
+                    continue
 
             pgn_str = game_obj.get("pgn", "")
             if not pgn_str or has_setup_tag(pgn_str):
@@ -483,12 +518,13 @@ def analyze_single_game_engine(
     date = headers.get("Date", "????.??.??")
     result_header = headers.get("Result", "*")
     link = headers.get("Link", "")
+    game_tc = headers.get("TimeControl", target_tc)
 
     mg_start, mg_end = get_phase_boundaries(game, reader)
     if reader is not None:
         reader.close()
 
-    base_sec, inc_sec = parse_time_control(target_tc)
+    base_sec, inc_sec = parse_time_control(game_tc)
     prev_clocks = {chess.WHITE: base_sec, chess.BLACK: base_sec}
 
     board = game.board()
@@ -651,13 +687,14 @@ def analyze_single_game_engine(
 
 def run_bullet_clock_analysis(username: str, target_tc: str, game_pgns: list[str]):
     print(f"\n[*] Step 3: Parsing clock timestamps across {len(game_pgns)} bullet games...")
-    base_sec, inc_sec = parse_time_control(target_tc)
     all_move_times = []
     game_move_counts = []
 
     for pgn_str in game_pgns:
         game = chess.pgn.read_game(io.StringIO(pgn_str))
         headers = game.headers
+        game_tc = headers.get("TimeControl", target_tc)
+        base_sec, inc_sec = parse_time_control(game_tc)
         white = headers.get("White", "")
         black = headers.get("Black", "")
         is_white = white.lower() == username.lower()
@@ -989,7 +1026,10 @@ if __name__ == "__main__":
         usage="%(prog)s player tc [options]"
     )
     parser.add_argument("player", help="Target Chess.com username")
-    parser.add_argument("tc", help="Exact TimeControl (e.g., 900+10, 600, 180+2, 60, 1/86400)")
+    parser.add_argument(
+        "tc",
+        help="TimeControl category (bullet, blitz, rapid, daily) or exact value (e.g., 900+10, 600, 180+2, 60, 1/86400)"
+    )
     parser.add_argument("-u", "--unrated", action="store_true", help="Include unrated/casual games (default: rated only)")
     parser.add_argument("--min-decisions", type=int, default=500, help="Target middlegame decision count (default: 500)")
     parser.add_argument("--workers", type=int, default=default_workers, help=f"Parallel worker processes (default: {default_workers})")
@@ -1006,9 +1046,17 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if not is_valid_tc_arg(args.tc):
+        parser.error(
+            f"Invalid time control '{args.tc}'. Must be a category (bullet, blitz, rapid, daily) "
+            f"or exact TimeControl (e.g., 900+10, 600, 1/86400)."
+        )
+
+    normalized_tc = args.tc.strip().lower() if args.tc.strip().lower() in VALID_TC_CATEGORIES else args.tc.strip()
+
     run_forensic_analysis(
         username=args.player,
-        target_tc=args.tc,
+        target_tc=normalized_tc,
         min_decisions=args.min_decisions,
         book_path=args.book,
         engine_path=args.engine,
