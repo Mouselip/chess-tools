@@ -23,8 +23,8 @@ import sys
 import urllib.error
 import urllib.request
 
-VERSION = "1.1.0"
-USER_AGENT = "chesscom-tc-pref/1.1.0"
+VERSION = "1.1.1"
+USER_AGENT = "chesscom-tc-pref/1.1.1"
 
 _orig_getaddrinfo = socket.getaddrinfo
 
@@ -200,7 +200,7 @@ def main():
     for idx, url in enumerate(target_archives, start=1):
         match = ym_pattern.search(url)
         ym_label = f"{match.group(1)}-{match.group(2)}" if match else url
-        sys.stderr.write(f"[{idx}/{total_archives}] Fetching {ym_label}...\n")
+        sys.stderr.write(f"[{idx}/{total_archives}] Parsing {ym_label}...\n")
 
         month_data = fetch_json(url)
         if not month_data:
