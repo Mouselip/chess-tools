@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tc-pref.py - Scan a target player's Chess.com archives to find their most preferred time control.
+chesscom-tc-pref.py - Scan a target player's Chess.com archives to find their most preferred time control.
 
 Copyright (C) 2026 Tyrin R. Price
 This program is free software: you can redistribute it and/or modify
@@ -18,17 +18,28 @@ import argparse
 from collections import Counter
 import json
 import re
+import socket
 import sys
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.2"
-USER_AGENT = "tc-pref/1.0.2"
+VERSION = "1.1.0"
+USER_AGENT = "chesscom-tc-pref/1.1.0"
+
+# Enforce IPv4-only resolution for all outbound socket connections
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_getaddrinfo
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        prog="tc-pref.py",
+        prog="chesscom-tc-pref.py",
         usage="%(prog)s [OPTIONS] USERNAME",
         description="Scan a target player's Chess.com archives to find their most preferred time control.",
         epilog="Copyright (C) 2026 Tyrin R. Price. Released under GNU GPL v3.",
