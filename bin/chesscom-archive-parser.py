@@ -33,18 +33,32 @@ Output Locations:
 
 Notes:
   - Archive downloads are cached: if a monthly PGN file already exists in ./archives/, downloading is skipped.
+  - All outbound HTTP/HTTPS requests are restricted strictly to IPv4.
 """
 
 import sys
 import os
+import socket
 import datetime
 import csv
 import time
 import requests
+import urllib3.util.connection as urllib3_cn
 import chess.pgn
 
-__version__ = "0.0.1"
+__version__ = "1.0.0"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+
+def force_ipv4():
+    """Force urllib3/requests to use IPv4 (AF_INET) exclusively."""
+    def allowed_gai_family():
+        return socket.AF_INET
+
+    urllib3_cn.allowed_gai_family = allowed_gai_family
+
+
+force_ipv4()
 
 
 def print_usage_and_exit(code=0):
@@ -193,6 +207,8 @@ def main():
         print_usage_and_exit(
             code=0 if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help") else 1
         )
+
+    print(f"chesscom-archive-parser v{__version__}")
 
     username = sys.argv[1].strip().lower()
 
