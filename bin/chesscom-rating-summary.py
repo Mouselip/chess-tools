@@ -37,7 +37,7 @@
 #   names, dates in evaluation details, clear trigger attribution, and pool breakdowns.
 #   Includes robust HTTP 429/transient retry backoff and an optional User-Agent CLI flag.
 #
-# Version: v2.1.2
+# Version: v2.1.3
 
 import argparse
 import datetime
@@ -52,7 +52,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "v2.1.2"
+VERSION = "v2.1.3"
 DEFAULT_REPO_URL = "https://github.com/Mouselip/chess-tools"
 
 # Pool and category filters
@@ -1102,10 +1102,7 @@ def main():
             if "Sandbagging-Surge Cycle" not in primary_triggers:
                 primary_triggers.append("Sandbagging-Surge Cycle")
         else:
-            sig_text = f"[Landslide #{l_idx}] {l_cat} | High-velocity tilt spiral / slump (-{l['drop']} pts over {l['game_count']} games, {l['loss_rate']:.1f}% loss rate) | {date_span_str}"
-            signals_smoke.append(sig_text)
-            if "High-Velocity Tilt Spiral / Slump" not in primary_triggers:
-                primary_triggers.append("High-Velocity Tilt Spiral / Slump")
+            suppressed_notes.append(f"[Suppressed Landslide #{l_idx}] {l_cat} | Organic tilt spiral / slump (-{l['drop']} pts over {l['game_count']} games, {l['loss_rate']:.1f}% loss rate) | {date_span_str}")
 
     # Check High-Accuracy Winning Streaks
     for idx_a, a_streak in enumerate(acc_streaks, start=1):
@@ -1203,9 +1200,8 @@ def main():
     print(f" Evaluation Details):", flush=True)
     for r in reasons:
         print(f"   * {r}", flush=True)
-
     if suppressed_notes:
-        print(f" Suppressed Signals (Pool-Congruent):", flush=True)
+        print(f" Suppressed Signals (Organic / Pool-Congruent):", flush=True)
         for note in suppressed_notes:
             print(f"   * {note}", flush=True)
 
